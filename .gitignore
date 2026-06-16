@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+*.app/
+.DS_Store
+DerivedData/
+*.xcodeproj/
+Package.resolved
