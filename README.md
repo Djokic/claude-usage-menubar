@@ -35,6 +35,27 @@ To see logs while developing, run the binary directly:
 The first time the app reads the Keychain, macOS will ask you to allow access to the
 `Claude Code-credentials` item — click **Allow** (or **Always Allow**).
 
+## Usage
+
+The app lives entirely in the menu bar (no Dock icon, no window):
+
+- **Hover** the rings → a popover shows each limit's progress bar, percent used, and reset
+  countdown, plus a refresh button. Moving the pointer into the popover keeps it open.
+- **Click** the icon → pins the popover open (so the refresh button is easy to hit). Click
+  again to dismiss.
+- **Right-click** the icon → **Refresh now** / **Quit Claude Usage**.
+- Usage refreshes automatically every 60 seconds; the refresh button forces an immediate update.
+
+## Appearance
+
+- **Two rings:** outer = the 5-hour session limit, inner = the 7-day weekly limit. The arc
+  length shows how much of each limit is used; a wider gap keeps the two rings distinct.
+- **Menu bar icon** is a monochrome template image while both limits are under 75% — it adapts
+  to the menu bar like Apple's own icons (white in dark mode, black in light mode).
+- **Color alerts:** a ring turns **orange at ≥75%** and **red at ≥90%** so an approaching limit
+  reads at a glance, even in the menu bar.
+- **Tooltip** progress bars use blue normally, with the same orange/red escalation.
+
 ## Tests
 
 ```sh
@@ -66,11 +87,29 @@ then allow Keychain access when macOS prompts.
 | `ClaudeUsageCore` | Pure, unit-tested logic: models, Keychain credentials + token refresh, usage client, formatting, ring geometry, app state. |
 | `ClaudeUsageApp`  | AppKit/SwiftUI shell: dual-ring `NSImage` renderer, `NSStatusItem` with hover/click popover + right-click menu, SwiftUI tooltip. |
 
-See `docs/plans/` for the full implementation plan.
+See `docs/plans/` for the full implementation plan, and
+`docs/residual-review-findings/` for known follow-up work surfaced by code review (a few
+reliability/security hardening items worth doing before heavy use).
+
+## Distribution
+
+This is a personal/power-user tool, best shared as a **directly distributed** app:
+
+- **Local use (today):** `build.sh` ad-hoc signs the bundle, so it runs on this machine.
+  Copying it to another Mac triggers a Gatekeeper warning until it's properly signed.
+- **Sharing it:** sign with a **Developer ID** certificate and **notarize** it (requires an
+  Apple Developer Program membership), then ship as a `.dmg`/`.zip`. No sandbox needed, so it
+  can keep reading the Keychain and shelling out to `security`.
+- **Mac App Store: not feasible as built.** App Store apps must run in the **App Sandbox**,
+  which cannot read another app's Keychain item (`Claude Code-credentials`) or spawn the
+  `/usr/bin/security` subprocess. The app also relies on an **undocumented Anthropic endpoint
+  and the Claude Code OAuth client**, which App Review prohibits (private API use,
+  impersonation, trademark). A store-eligible version would need an official third-party usage
+  API, its own OAuth sign-in, full sandboxing, and Anthropic's blessing for the branding.
 
 ## Limitations
 
-- Uses an **undocumented** Claude OAuth usage endpoint; it may change without notice.
-- The app is ad-hoc signed; distributing it to other machines would need code signing /
-  notarization (out of scope).
+- Uses an **undocumented** Claude OAuth usage endpoint; it may change or break without notice.
+- Reuses Claude Code's Keychain credentials (and refreshes the shared OAuth token), so it
+  depends on Claude Code being installed and signed in.
 - Launch-at-login, a preferences window, and per-model breakdown rows are deferred follow-ups.
