@@ -190,17 +190,25 @@ public actor CredentialStore: TokenProvider {
         return newCredentials
     }
 
-    /// Write credentials to the Keychain via the `security` CLI.
+    /// Write credentials to the Keychain via the `security` CLI. The secret JSON is fed over
+    /// **stdin** (trailing `-w` with no inline value), so the access/refresh tokens never appear
+    /// in the process argument list where any same-user process could read them.
+    ///
+    /// `add-generic-password -w` with no inline value prompts for the password and a "retype"
+    /// confirmation, reading both from stdin — so the (single-line) JSON is sent twice, one line
+    /// each. Keeping the `security` CLI as the accessor preserves the existing Keychain ACL
+    /// (no new approval prompt), versus switching to the in-process SecItem APIs.
     func persist(_ credentials: ClaudeCredentials) async throws {
         let envelope = CredentialsEnvelope(claudeAiOauth: credentials)
         let data = try JSONEncoder().encode(envelope)
         let json = String(data: data, encoding: .utf8) ?? "{}"
+        let stdin = "\(json)\n\(json)\n"
         _ = try await runCommand("/usr/bin/security", [
             "add-generic-password", "-U",
             "-a", Self.keychainAccount,
             "-s", Self.keychainService,
-            "-w", json,
-        ])
+            "-w",
+        ], stdin: stdin)
     }
 
     // MARK: TokenProvider
