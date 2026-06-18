@@ -88,13 +88,16 @@ import Foundation
         #expect(creds.refreshToken == "rotated-ref")
         #expect(creds.expiresAt == Int(fixedNow.timeIntervalSince1970 * 1000) + 3600 * 1000)
 
-        // Persist invoked with the update flag, account, service, and rotated token.
+        // Persist invoked with the update flag, account, service; the rotated token travels
+        // via stdin, never in the argument list.
         let persist = try #require(runner.lastPersistArguments)
         #expect(persist.contains("-U"))
         #expect(persist.contains("claude-cli"))
         #expect(persist.contains("Claude Code-credentials"))
-        let persistedJSON = try #require(persist.last)
-        #expect(persistedJSON.contains("rotated-ref"))
+        #expect(persist.last == "-w")  // trailing -w with no inline value
+        #expect(!persist.contains(where: { $0.contains("rotated-ref") }))
+        let stdin = try #require(runner.lastPersistStdin)
+        #expect(stdin.contains("rotated-ref"))
     }
 
     @Test func loadThrowsWhenKeychainFailsAndNoFallback() async {
@@ -214,5 +217,24 @@ import Foundation
         await #expect(throws: CredentialError.self) { try await store.refresh() }
         let retried = try await store.refresh()  // in-flight task was cleared; a new one runs
         #expect(retried.accessToken == "ok")
+    }
+
+    // Covers R3: the persisted secret travels via stdin and never appears in the argument list.
+    @Test func persistFeedsSecretViaStdinNotArgs() async throws {
+        let runner = FakeCommandRunner()
+        let store = CredentialStore(runner: runner, transport: FakeTransport())
+        let tricky = ClaudeCredentials(accessToken: "a'b\"c\\d", refreshToken: "secret-RT", expiresAt: 999)
+        try await store.persist(tricky)
+
+        let args = try #require(runner.lastPersistArguments)
+        #expect(args.last == "-w")
+        #expect(!args.contains(where: { $0.contains("secret-RT") }))  // token never in argv
+
+        let stdin = try #require(runner.lastPersistStdin)
+        #expect(stdin.contains("secret-RT"))
+        // The secret round-trips: the first stdin line decodes back to the original credentials.
+        let firstLine = try #require(stdin.split(separator: "\n").first)
+        let roundTripped = try store.decodeEnvelope(String(firstLine))
+        #expect(roundTripped == tricky)
     }
 }
