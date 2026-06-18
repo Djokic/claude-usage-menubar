@@ -38,7 +38,11 @@ public protocol TokenProvider: Sendable {
 
 /// Loads Claude credentials from the macOS Keychain (with a credentials-file fallback),
 /// refreshes the OAuth token when near expiry, and persists rotated tokens back.
-public final class CredentialStore: TokenProvider, @unchecked Sendable {
+///
+/// An `actor` so all credential operations are serialized — that gives us a safe home for
+/// single-flight refresh state and removes the previous `@unchecked Sendable`. The blocking
+/// `security` subprocess is always run off the actor's executor (see `runCommand`).
+public actor CredentialStore: TokenProvider {
     public static let keychainService = "Claude Code-credentials"
     public static let keychainAccount = "claude-cli"
 
@@ -50,13 +54,13 @@ public final class CredentialStore: TokenProvider, @unchecked Sendable {
 
     private let runner: CommandRunner
     private let transport: HTTPTransport
-    private let now: () -> Date
+    private let now: @Sendable () -> Date
     private let fallbackFileURL: URL
 
     public init(
         runner: CommandRunner = ProcessCommandRunner(),
         transport: HTTPTransport = URLSessionTransport(),
-        now: @escaping () -> Date = Date.init,
+        now: @escaping @Sendable () -> Date = Date.init,
         fallbackFileURL: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/.credentials.json")
     ) {
@@ -66,13 +70,26 @@ public final class CredentialStore: TokenProvider, @unchecked Sendable {
         self.fallbackFileURL = fallbackFileURL
     }
 
+    // MARK: Off-actor command execution
+
+    /// Run the blocking `security` subprocess off the actor's executor (on a background queue)
+    /// so a slow or prompt-blocked Keychain call never stalls a cooperative thread / main actor.
+    private func runCommand(_ executable: String, _ arguments: [String], stdin: String? = nil) async throws -> String {
+        let runner = self.runner
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(with: Result { try runner.run(executable, arguments, stdin: stdin) })
+            }
+        }
+    }
+
     // MARK: Loading
 
     /// Read credentials from the Keychain; fall back to `~/.claude/.credentials.json`
     /// only when the Keychain read itself fails (item missing / access denied).
-    public func load() throws -> ClaudeCredentials {
+    public func load() async throws -> ClaudeCredentials {
         do {
-            let raw = try runner.run(
+            let raw = try await runCommand(
                 "/usr/bin/security",
                 ["find-generic-password", "-s", Self.keychainService, "-w"]
             )
@@ -88,12 +105,12 @@ public final class CredentialStore: TokenProvider, @unchecked Sendable {
         }
     }
 
-    private func loadFromFallbackFile() throws -> ClaudeCredentials? {
+    private nonisolated func loadFromFallbackFile() throws -> ClaudeCredentials? {
         guard let data = try? Data(contentsOf: fallbackFileURL) else { return nil }
         return try decodeEnvelope(String(data: data, encoding: .utf8) ?? "")
     }
 
-    func decodeEnvelope(_ raw: String) throws -> ClaudeCredentials {
+    nonisolated func decodeEnvelope(_ raw: String) throws -> ClaudeCredentials {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = trimmed.data(using: .utf8), !trimmed.isEmpty else {
             throw CredentialError.decodingFailed("empty credentials blob")
@@ -107,7 +124,7 @@ public final class CredentialStore: TokenProvider, @unchecked Sendable {
 
     // MARK: Expiry
 
-    func isExpired(_ credentials: ClaudeCredentials, now: Date) -> Bool {
+    nonisolated func isExpired(_ credentials: ClaudeCredentials, now: Date) -> Bool {
         let nowMs = now.timeIntervalSince1970 * 1000
         return Double(credentials.expiresAt) - Self.expiryBufferMs <= nowMs
     }
@@ -118,7 +135,7 @@ public final class CredentialStore: TokenProvider, @unchecked Sendable {
     /// Re-reads current credentials first so tokens Claude Code already rotated are used.
     @discardableResult
     public func refresh() async throws -> ClaudeCredentials {
-        let current = try load()
+        let current = try await load()
 
         var request = URLRequest(url: Self.refreshURL)
         request.httpMethod = "POST"
@@ -151,17 +168,16 @@ public final class CredentialStore: TokenProvider, @unchecked Sendable {
             refreshToken: parsed.refreshToken,
             expiresAt: Int(now().timeIntervalSince1970 * 1000) + parsed.expiresIn * 1000
         )
-        try persist(newCredentials)
+        try await persist(newCredentials)
         return newCredentials
     }
 
-    /// Write credentials to the Keychain. Passing the JSON as a single process argument
-    /// (no shell) means no quote-escaping is needed and special characters survive intact.
-    func persist(_ credentials: ClaudeCredentials) throws {
+    /// Write credentials to the Keychain via the `security` CLI.
+    func persist(_ credentials: ClaudeCredentials) async throws {
         let envelope = CredentialsEnvelope(claudeAiOauth: credentials)
         let data = try JSONEncoder().encode(envelope)
         let json = String(data: data, encoding: .utf8) ?? "{}"
-        _ = try runner.run("/usr/bin/security", [
+        _ = try await runCommand("/usr/bin/security", [
             "add-generic-password", "-U",
             "-a", Self.keychainAccount,
             "-s", Self.keychainService,
@@ -172,7 +188,7 @@ public final class CredentialStore: TokenProvider, @unchecked Sendable {
     // MARK: TokenProvider
 
     public func validAccessToken() async throws -> String {
-        let credentials = try load()
+        let credentials = try await load()
         if isExpired(credentials, now: now()) {
             return try await refresh().accessToken
         }

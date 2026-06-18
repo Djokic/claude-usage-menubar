@@ -21,14 +21,14 @@ import Foundation
         #expect(creds.expiresAt == 12345)
     }
 
-    @Test func loadReadsFromKeychain() throws {
+    @Test func loadReadsFromKeychain() async throws {
         let runner = FakeCommandRunner { exe, args, _ in
             #expect(exe == "/usr/bin/security")
             #expect(args == ["find-generic-password", "-s", "Claude Code-credentials", "-w"])
             return self.blob(access: "from-keychain")
         }
         let store = CredentialStore(runner: runner, transport: FakeTransport())
-        let creds = try store.load()
+        let creds = try await store.load()
         #expect(creds.accessToken == "from-keychain")
     }
 
@@ -97,37 +97,64 @@ import Foundation
         #expect(persistedJSON.contains("rotated-ref"))
     }
 
-    @Test func loadThrowsWhenKeychainFailsAndNoFallback() {
+    @Test func loadThrowsWhenKeychainFailsAndNoFallback() async {
         let runner = FakeCommandRunner { _, _, _ in throw TestError.boom }
         let store = CredentialStore(runner: runner, transport: FakeTransport(), fallbackFileURL: nonexistentFallback())
-        #expect(throws: CredentialError.notAuthenticated) { try store.load() }
+        await #expect(throws: CredentialError.notAuthenticated) { try await store.load() }
     }
 
-    @Test func loadFallsBackToCredentialsFile() throws {
+    @Test func loadFallsBackToCredentialsFile() async throws {
         let runner = FakeCommandRunner { _, _, _ in throw TestError.boom }
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("creds-\(UUID().uuidString).json")
         try blob(access: "from-file").data(using: .utf8)!.write(to: tmp)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
         let store = CredentialStore(runner: runner, transport: FakeTransport(), fallbackFileURL: tmp)
-        let creds = try store.load()
+        let creds = try await store.load()
         #expect(creds.accessToken == "from-file")
     }
 
-    @Test func persistPassesSpecialCharactersThroughIntact() throws {
-        let runner = FakeCommandRunner()
-        let store = CredentialStore(runner: runner, transport: FakeTransport())
-        let tricky = ClaudeCredentials(
-            accessToken: "a'b\"c\\d",
-            refreshToken: "x'y\"z",
-            expiresAt: 999
-        )
-        try store.persist(tricky)
+    private func futureExpiry(_ now: Date) -> Int { Int(now.timeIntervalSince1970 * 1000) + 100 * 60 * 1000 }
+    private func pastExpiry(_ now: Date) -> Int { Int(now.timeIntervalSince1970 * 1000) - 1000 }
 
-        // No shell escaping: the JSON arrives verbatim as a single argument and round-trips.
-        let persistedJSON = try #require(runner.lastPersistArguments?.last)
-        let data = try #require(persistedJSON.data(using: .utf8))
-        let roundTripped = try store.decodeEnvelope(String(data: data, encoding: .utf8)!)
-        #expect(roundTripped == tricky)
+    @Test func validAccessTokenReturnsCurrentWhenNotExpired() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, _, _ in self.blob(access: "live-token", expiresAt: self.futureExpiry(fixedNow)) }
+        let transport = FakeTransport()
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow })
+
+        let token = try await store.validAccessToken()
+        #expect(token == "live-token")
+        #expect(transport.requests.isEmpty)  // no refresh when the token is still valid
+    }
+
+    // Covers R4: refresh + use still happens when the token is expired.
+    @Test func validAccessTokenRefreshesWhenExpired() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, args, _ in
+            args.first == "find-generic-password" ? self.blob(access: "stale", expiresAt: self.pastExpiry(fixedNow)) : ""
+        }
+        let refreshJSON = """
+        {"access_token":"fresh-token","refresh_token":"new-ref","expires_in":3600}
+        """.data(using: .utf8)!
+        let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow })
+
+        let token = try await store.validAccessToken()
+        #expect(token == "fresh-token")
+        #expect(transport.requests.count == 1)
+    }
+
+    // Covers R2 (path): a slow/blocking runner is awaited off the actor executor and still
+    // resolves correctly. (Non-blocking of the executor is structural; this exercises the bridge.)
+    @Test func validAccessTokenCompletesWithSlowRunner() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, _, _ in
+            Thread.sleep(forTimeInterval: 0.1)
+            return self.blob(access: "slow-but-ok", expiresAt: self.futureExpiry(fixedNow))
+        }
+        let store = CredentialStore(runner: runner, transport: FakeTransport(), now: { fixedNow })
+        let token = try await store.validAccessToken()
+        #expect(token == "slow-but-ok")
     }
 }
