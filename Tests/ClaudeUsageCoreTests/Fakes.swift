@@ -3,22 +3,26 @@ import Foundation
 
 /// Records calls and returns canned output (or throws) for the `security` CLI seam.
 final class FakeCommandRunner: CommandRunner, @unchecked Sendable {
-    var handler: (String, [String]) throws -> String
-    private(set) var calls: [(executable: String, arguments: [String])] = []
+    var handler: (String, [String], String?) throws -> String
+    private(set) var calls: [(executable: String, arguments: [String], stdin: String?)] = []
 
-    init(handler: @escaping (String, [String]) throws -> String = { _, _ in "" }) {
+    init(handler: @escaping (String, [String], String?) throws -> String = { _, _, _ in "" }) {
         self.handler = handler
     }
 
-    func run(_ executable: String, _ arguments: [String]) throws -> String {
-        calls.append((executable, arguments))
-        return try handler(executable, arguments)
+    func run(_ executable: String, _ arguments: [String], stdin: String?) throws -> String {
+        calls.append((executable, arguments, stdin))
+        return try handler(executable, arguments, stdin)
     }
 
-    /// The last `add-generic-password` (persist) call, if any.
-    var lastPersistArguments: [String]? {
-        calls.last(where: { $0.arguments.first == "add-generic-password" })?.arguments
+    private var lastPersistCall: (executable: String, arguments: [String], stdin: String?)? {
+        calls.last(where: { $0.arguments.first == "add-generic-password" })
     }
+
+    /// The last `add-generic-password` (persist) call's arguments, if any.
+    var lastPersistArguments: [String]? { lastPersistCall?.arguments }
+    /// The stdin fed to the last persist call (where the secret now travels).
+    var lastPersistStdin: String? { lastPersistCall?.stdin }
 }
 
 /// Returns queued HTTP responses (or throws), recording the requests it received.
