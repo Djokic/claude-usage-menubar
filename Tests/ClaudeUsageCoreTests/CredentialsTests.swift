@@ -157,4 +157,62 @@ import Foundation
         let token = try await store.validAccessToken()
         #expect(token == "slow-but-ok")
     }
+
+    // Covers R1: concurrent refreshes coalesce into a single OAuth POST.
+    @Test func concurrentRefreshesCoalesceIntoOnePost() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, args, _ in
+            args.first == "find-generic-password"
+                ? self.blob(refresh: "old-ref", expiresAt: self.pastExpiry(fixedNow))
+                : ""
+        }
+        let refreshJSON = """
+        {"access_token":"coalesced","refresh_token":"rotated","expires_in":3600}
+        """.data(using: .utf8)!
+        let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])  // only ONE response available
+        transport.delay = 0.2  // hold the in-flight refresh so all callers join it
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow })
+
+        let results = try await withThrowingTaskGroup(of: ClaudeCredentials.self) { group in
+            for _ in 0..<10 { group.addTask { try await store.refresh() } }
+            var all: [ClaudeCredentials] = []
+            for try await r in group { all.append(r) }
+            return all
+        }
+
+        #expect(transport.requests.count == 1)  // one rotation for all 10 callers
+        #expect(results.count == 10)
+        #expect(results.allSatisfy { $0.accessToken == "coalesced" })
+    }
+
+    @Test func refreshAfterCompletionStartsNewPost() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, args, _ in
+            args.first == "find-generic-password" ? self.blob(refresh: "r", expiresAt: self.pastExpiry(fixedNow)) : ""
+        }
+        let json1 = #"{"access_token":"a1","refresh_token":"r1","expires_in":3600}"#.data(using: .utf8)!
+        let json2 = #"{"access_token":"a2","refresh_token":"r2","expires_in":3600}"#.data(using: .utf8)!
+        let transport = FakeTransport(stubs: [.init(json1, 200), .init(json2, 200)])
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow })
+
+        let first = try await store.refresh()
+        let second = try await store.refresh()
+        #expect(first.accessToken == "a1")
+        #expect(second.accessToken == "a2")  // a later refresh is a genuinely new exchange
+        #expect(transport.requests.count == 2)
+    }
+
+    @Test func failedRefreshPropagatesAndAllowsRetry() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, args, _ in
+            args.first == "find-generic-password" ? self.blob(refresh: "r", expiresAt: self.pastExpiry(fixedNow)) : ""
+        }
+        let okJSON = #"{"access_token":"ok","refresh_token":"r2","expires_in":3600}"#.data(using: .utf8)!
+        let transport = FakeTransport(stubs: [.init(Data(), 500), .init(okJSON, 200)])
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow })
+
+        await #expect(throws: CredentialError.self) { try await store.refresh() }
+        let retried = try await store.refresh()  // in-flight task was cleared; a new one runs
+        #expect(retried.accessToken == "ok")
+    }
 }
