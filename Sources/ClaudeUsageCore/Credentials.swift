@@ -131,14 +131,32 @@ public actor CredentialStore: TokenProvider {
 
     // MARK: Refresh
 
+    private var inFlightRefresh: Task<ClaudeCredentials, Error>?
+
     /// Refresh the OAuth token and persist the (rotated) credentials back to the Keychain.
-    /// Re-reads current credentials first so tokens Claude Code already rotated are used.
+    /// Single-flight: concurrent callers (poll tick, manual refresh, 401 retry) coalesce onto
+    /// one in-flight refresh, so the single-use refresh token is exchanged exactly once.
     @discardableResult
     public func refresh() async throws -> ClaudeCredentials {
+        if let existing = inFlightRefresh {
+            return try await existing.value
+        }
+        // No `await` between the nil-check and this assignment, so reentrancy during the awaits
+        // inside the task cannot start a second refresh.
+        let task = Task { try await self.performRefresh() }
+        inFlightRefresh = task
+        defer { inFlightRefresh = nil }
+        return try await task.value
+    }
+
+    /// Re-reads current credentials (so a token Claude Code already rotated is used),
+    /// exchanges the refresh token, and persists the rotated set.
+    private func performRefresh() async throws -> ClaudeCredentials {
         let current = try await load()
 
         var request = URLRequest(url: Self.refreshURL)
         request.httpMethod = "POST"
+        request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: String] = [
             "grant_type": "refresh_token",

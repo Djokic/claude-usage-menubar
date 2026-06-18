@@ -38,6 +38,8 @@ final class FakeTransport: HTTPTransport, @unchecked Sendable {
 
     private var stubs: [Stub]
     var errorToThrow: Error?
+    /// Optional artificial latency so concurrent callers genuinely overlap in tests.
+    var delay: TimeInterval = 0
     private(set) var requests: [URLRequest] = []
 
     init(stubs: [Stub] = [], errorToThrow: Error? = nil) {
@@ -47,6 +49,7 @@ final class FakeTransport: HTTPTransport, @unchecked Sendable {
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         requests.append(request)
+        if delay > 0 { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
         if let errorToThrow { throw errorToThrow }
         let stub = stubs.isEmpty ? Stub(Data(), 500) : stubs.removeFirst()
         let http = HTTPURLResponse(
