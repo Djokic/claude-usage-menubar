@@ -22,7 +22,7 @@ import Foundation
     }
 
     @Test func loadReadsFromKeychain() throws {
-        let runner = FakeCommandRunner { exe, args in
+        let runner = FakeCommandRunner { exe, args, _ in
             #expect(exe == "/usr/bin/security")
             #expect(args == ["find-generic-password", "-s", "Claude Code-credentials", "-w"])
             return self.blob(access: "from-keychain")
@@ -48,7 +48,7 @@ import Foundation
 
     // Covers R6: refresh posts the correct OAuth body.
     @Test func refreshBuildsCorrectPostBody() async throws {
-        let runner = FakeCommandRunner { _, args in
+        let runner = FakeCommandRunner { _, args, _ in
             args.first == "find-generic-password" ? self.blob(refresh: "old-refresh") : ""
         }
         let refreshJSON = """
@@ -72,7 +72,7 @@ import Foundation
     }
 
     @Test func refreshComputesExpiryAndPersistsRotatedToken() async throws {
-        let runner = FakeCommandRunner { _, args in
+        let runner = FakeCommandRunner { _, args, _ in
             args.first == "find-generic-password" ? self.blob(refresh: "old-refresh") : ""
         }
         let refreshJSON = """
@@ -98,13 +98,13 @@ import Foundation
     }
 
     @Test func loadThrowsWhenKeychainFailsAndNoFallback() {
-        let runner = FakeCommandRunner { _, _ in throw TestError.boom }
+        let runner = FakeCommandRunner { _, _, _ in throw TestError.boom }
         let store = CredentialStore(runner: runner, transport: FakeTransport(), fallbackFileURL: nonexistentFallback())
         #expect(throws: CredentialError.notAuthenticated) { try store.load() }
     }
 
     @Test func loadFallsBackToCredentialsFile() throws {
-        let runner = FakeCommandRunner { _, _ in throw TestError.boom }
+        let runner = FakeCommandRunner { _, _, _ in throw TestError.boom }
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("creds-\(UUID().uuidString).json")
         try blob(access: "from-file").data(using: .utf8)!.write(to: tmp)
         defer { try? FileManager.default.removeItem(at: tmp) }

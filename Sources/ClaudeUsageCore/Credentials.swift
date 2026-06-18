@@ -22,6 +22,7 @@ struct CredentialsEnvelope: Codable {
 public enum CredentialError: Error, Equatable {
     case notAuthenticated
     case commandFailed(status: Int32, message: String)
+    case commandTimedOut
     case refreshFailed(status: Int, message: String)
     case decodingFailed(String)
 }
