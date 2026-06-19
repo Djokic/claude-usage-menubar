@@ -1,7 +1,7 @@
 ---
 title: "fix: Make OAuth token refresh and keychain writes safe"
 type: fix
-status: active
+status: completed
 created: 2026-06-19
 depth: standard
 ---
