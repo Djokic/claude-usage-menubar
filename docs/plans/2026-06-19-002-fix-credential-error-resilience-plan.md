@@ -1,7 +1,7 @@
 ---
 title: "fix: Resilient credential errors — non-fatal persist, in-memory cache, clear messages"
 type: fix
-status: active
+status: completed
 created: 2026-06-19
 depth: standard
 ---
