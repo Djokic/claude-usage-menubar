@@ -24,11 +24,12 @@ import Foundation
         }
     }
 
-    // Covers R5: large output on both pipes must not deadlock.
+    // Covers R5: large output written to BOTH pipes concurrently must not deadlock.
+    // The `& ... & wait` form fills stdout and stderr simultaneously (each past the ~64 KB
+    // pipe buffer); a sequential single-pipe drain would deadlock here.
     @Test func drainsLargeStdoutAndStderrWithoutDeadlock() throws {
-        let runner = ProcessCommandRunner(timeout: 20)
-        // Write ~200 KB to stdout and ~200 KB to stderr (well past a single pipe buffer).
-        let script = "yes ABCDEFGH | head -c 200000; yes abcdefgh | head -c 200000 1>&2"
+        let runner = ProcessCommandRunner(timeout: 10)
+        let script = "yes ABCDEFGH | head -c 200000 & yes abcdefgh | head -c 200000 1>&2 & wait"
         let output = try runner.run("/bin/sh", ["-c", script])
         #expect(output.count == 200000)
     }
@@ -42,6 +43,17 @@ import Foundation
         }
         // Should return at ~the timeout, not wait the full 5 seconds.
         #expect(Date().timeIntervalSince(start) < 3)
+    }
+
+    // Covers R2 robustness: a child that ignores SIGTERM is escalated to SIGKILL, and run()
+    // returns (never hangs) even when a grandchild keeps the pipes open.
+    @Test func timesOutEvenWhenChildIgnoresSIGTERM() {
+        let runner = ProcessCommandRunner(timeout: 0.5)
+        let start = Date()
+        #expect(throws: CredentialError.commandTimedOut) {
+            try runner.run("/bin/sh", ["-c", "trap '' TERM; sleep 5"])
+        }
+        #expect(Date().timeIntervalSince(start) < 5)
     }
 
     @Test func worksWithoutStdin() throws {

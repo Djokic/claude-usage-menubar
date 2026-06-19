@@ -237,4 +237,25 @@ import Foundation
         let roundTripped = try store.decodeEnvelope(String(firstLine))
         #expect(roundTripped == tricky)
     }
+
+    // Covers R1 under cancellation: cancelling one caller mid-refresh must not let a concurrent
+    // caller start a second token rotation. The slot stays occupied until the work completes.
+    @Test func cancellingACallerKeepsSingleFlightIntact() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, args, _ in
+            args.first == "find-generic-password" ? self.blob(refresh: "r", expiresAt: self.pastExpiry(fixedNow)) : ""
+        }
+        let refreshJSON = #"{"access_token":"one","refresh_token":"r2","expires_in":3600}"#.data(using: .utf8)!
+        let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])  // only ONE response
+        transport.delay = 0.3
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow })
+
+        let a = Task { try? await store.refresh() }
+        try await Task.sleep(nanoseconds: 50_000_000)  // let A occupy the in-flight slot
+        a.cancel()
+
+        let result = try await store.refresh()  // B joins the still-running refresh
+        #expect(result.accessToken == "one")
+        #expect(transport.requests.count == 1)  // a single rotation despite the cancel
+    }
 }

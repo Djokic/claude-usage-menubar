@@ -1,6 +1,10 @@
 import AppKit
 import Foundation
 
+// Ignore SIGPIPE so writing a secret to a subprocess (the `security` CLI) whose read end has
+// already closed fails the syscall as EPIPE (caught locally) instead of terminating the app.
+signal(SIGPIPE, SIG_IGN)
+
 // Headless verification path: render sample ring icons to PNGs and exit (no UI).
 if let index = CommandLine.arguments.firstIndex(of: "--render-samples") {
     let path = CommandLine.arguments.indices.contains(index + 1)
