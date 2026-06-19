@@ -23,7 +23,6 @@ public enum CredentialError: Error, Equatable, LocalizedError {
     case notAuthenticated
     case commandFailed(status: Int32, message: String)
     case commandTimedOut
-    case refreshFailed(status: Int, message: String)
     case decodingFailed(String)
 
     /// Human, actionable text shown in the UI — never a raw "CredentialError error N".
@@ -35,114 +34,109 @@ public enum CredentialError: Error, Equatable, LocalizedError {
             return "Couldn't read your Claude credentials from the Keychain (security exited \(status)). Make sure Claude Code is installed and allow Keychain access if macOS prompts."
         case .commandTimedOut:
             return "Keychain access timed out. Try again, and allow access if macOS prompts."
-        case let .refreshFailed(status, _):
-            return "Couldn't refresh your Claude session (HTTP \(status)). Sign in to Claude Code again."
         case .decodingFailed:
             return "Couldn't read the stored Claude credentials. Sign in to Claude Code again."
         }
     }
 }
 
-/// Abstraction so the usage client can obtain a usable access token (refreshing if needed)
-/// without depending on the concrete Keychain-backed store.
-public protocol TokenProvider: Sendable {
-    /// A non-expired access token, refreshing transparently if the cached one is near expiry.
-    func validAccessToken() async throws -> String
-    /// Force a refresh and return the new access token (used after a 401).
-    func forceRefreshAccessToken() async throws -> String
+/// A point-in-time read of the stored access token and whether it is currently usable.
+public struct TokenSnapshot: Equatable, Sendable {
+    public let accessToken: String
+    public let isExpired: Bool
+
+    public init(accessToken: String, isExpired: Bool) {
+        self.accessToken = accessToken
+        self.isExpired = isExpired
+    }
 }
 
-/// Loads Claude credentials from the macOS Keychain (with a credentials-file fallback),
-/// refreshes the OAuth token when near expiry, and persists rotated tokens back.
+/// Read-only provider of the Claude Code access token.
 ///
-/// An `actor` so all credential operations are serialized — that gives us a safe home for
-/// single-flight refresh state and removes the previous `@unchecked Sendable`. The blocking
-/// `security` subprocess is always run off the actor's executor (see `runCommand`).
+/// The app deliberately never refreshes. Claude Code's refresh token is **single-use and
+/// rotating**: refreshing it consumes the shared token and issues a new one, so an independent
+/// refresh by this app would desync (and eventually log out) the Claude Code CLI. We only ever
+/// read whatever token Claude Code currently maintains. See
+/// `docs/plans/2026-06-19-003-fix-read-only-credentials-plan.md`.
+public protocol TokenProvider: Sendable {
+    /// The currently stored access token plus whether it is expired. Never refreshes or mutates.
+    func currentToken() async throws -> TokenSnapshot
+}
+
+/// Reads Claude credentials from the macOS Keychain (with a credentials-file fallback).
+///
+/// Strictly read-only: it never refreshes the OAuth token and never writes the Keychain, so it
+/// cannot consume Claude Code's rotating refresh token. An `actor` so the blocking `security`
+/// subprocess (always run off the actor's executor — see `runCommand`) is serialized cleanly.
 public actor CredentialStore: TokenProvider {
     public static let keychainService = "Claude Code-credentials"
-    public static let keychainAccount = "claude-cli"
 
-    private static let refreshURL = URL(string: "https://console.anthropic.com/v1/oauth/token")!
-    private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    private static let scope = "user:profile user:inference user:sessions:claude_code"
-    /// Refresh once we're within this many milliseconds of expiry.
+    /// Treat a token within this many milliseconds of expiry as expired — the same cushion
+    /// Claude Code uses before it refreshes, so we stop showing a token that's about to die.
     private static let expiryBufferMs: Double = 5 * 60 * 1000
 
     private let runner: CommandRunner
-    private let transport: HTTPTransport
     private let now: @Sendable () -> Date
     private let fallbackFileURL: URL
 
     public init(
         runner: CommandRunner = ProcessCommandRunner(),
-        transport: HTTPTransport = URLSessionTransport(),
         now: @escaping @Sendable () -> Date = Date.init,
         fallbackFileURL: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/.credentials.json")
     ) {
         self.runner = runner
-        self.transport = transport
         self.now = now
         self.fallbackFileURL = fallbackFileURL
     }
 
-    /// Holds the rotated token so a failed Keychain write-back doesn't revert to a stale entry.
-    private var cachedCredentials: ClaudeCredentials?
+    // MARK: TokenProvider
+
+    public func currentToken() async throws -> TokenSnapshot {
+        let credentials = try await load()
+        return TokenSnapshot(
+            accessToken: credentials.accessToken,
+            isExpired: isExpired(credentials, now: now())
+        )
+    }
 
     // MARK: Off-actor command execution
 
     /// Run the blocking `security` subprocess off the actor's executor (on a background queue)
-    /// so a slow or prompt-blocked Keychain call never stalls a cooperative thread / main actor.
-    private func runCommand(_ executable: String, _ arguments: [String], stdin: String? = nil) async throws -> String {
+    /// so a slow or prompt-blocked Keychain read never stalls a cooperative thread / main actor.
+    private func runCommand(_ executable: String, _ arguments: [String]) async throws -> String {
         let runner = self.runner
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global().async {
-                continuation.resume(with: Result { try runner.run(executable, arguments, stdin: stdin) })
+                continuation.resume(with: Result { try runner.run(executable, arguments) })
             }
         }
     }
 
     // MARK: Loading
 
-    /// Read credentials from the Keychain; fall back to `~/.claude/.credentials.json`
-    /// only when the Keychain read itself fails (item missing / access denied).
+    /// Read credentials from the Keychain; fall back to `~/.claude/.credentials.json` only when
+    /// the Keychain read itself fails (item missing / access denied). Corrupt Keychain JSON is
+    /// surfaced as `decodingFailed` rather than masked by the fallback.
     public func load() async throws -> ClaudeCredentials {
         do {
             let raw = try await runCommand(
                 "/usr/bin/security",
                 ["find-generic-password", "-s", Self.keychainService, "-w"]
             )
-            return cacheFreshest(try decodeEnvelope(raw))
+            return try decodeEnvelope(raw)
         } catch let error as CredentialError {
-            // Corrupt Keychain JSON: fall back to a known-good cached token if we have one
-            // (a transient truncation shouldn't hard-fail), otherwise surface the corruption.
-            if case .decodingFailed = error {
-                if let cached = cachedCredentials { return cached }
-                throw error
-            }
+            if case .decodingFailed = error { throw error }
             return try fallbackCredentials()
         } catch {
             return try fallbackCredentials()
         }
     }
 
-    /// Keychain read failed: prefer an in-memory token (e.g. a rotated one we couldn't persist),
-    /// then the credentials-file fallback, then surface "not signed in".
+    /// Keychain read failed: try the credentials-file fallback, then surface "not signed in".
     private func fallbackCredentials() throws -> ClaudeCredentials {
-        if let cached = cachedCredentials { return cached }
-        if let creds = try loadFromFallbackFile() { return cacheFreshest(creds) }
+        if let creds = try loadFromFallbackFile() { return creds }
         throw CredentialError.notAuthenticated
-    }
-
-    /// Update the cache to the freshest of `credentials` and the current cache (by `expiresAt`)
-    /// and return that. The Keychain wins ties, so external rotations by Claude Code are
-    /// respected; the cache only wins when it is strictly newer (we rotated but couldn't persist).
-    private func cacheFreshest(_ credentials: ClaudeCredentials) -> ClaudeCredentials {
-        if let cached = cachedCredentials, cached.expiresAt > credentials.expiresAt {
-            return cached
-        }
-        cachedCredentials = credentials
-        return credentials
     }
 
     private nonisolated func loadFromFallbackFile() throws -> ClaudeCredentials? {
@@ -167,135 +161,5 @@ public actor CredentialStore: TokenProvider {
     nonisolated func isExpired(_ credentials: ClaudeCredentials, now: Date) -> Bool {
         let nowMs = now.timeIntervalSince1970 * 1000
         return Double(credentials.expiresAt) - Self.expiryBufferMs <= nowMs
-    }
-
-    // MARK: Refresh
-
-    private var inFlightRefresh: Task<ClaudeCredentials, Error>?
-
-    /// Refresh the OAuth token and persist the (rotated) credentials back to the Keychain.
-    /// Single-flight: concurrent callers (poll tick, manual refresh, 401 retry) coalesce onto
-    /// one in-flight refresh, so the single-use refresh token is exchanged exactly once.
-    @discardableResult
-    public func refresh() async throws -> ClaudeCredentials {
-        if let existing = inFlightRefresh {
-            return try await existing.value
-        }
-        // No `await` between the nil-check and this assignment, so reentrancy during the awaits
-        // inside the task cannot start a second refresh.
-        let task = Task { () async throws -> ClaudeCredentials in
-            // Clear the slot when the refresh itself finishes — NOT in the caller's `defer`.
-            // If the calling task is cancelled, its `await task.value` throws but this Task keeps
-            // running; clearing here keeps the slot occupied until the real work completes, so a
-            // concurrent caller joins it instead of starting a second (single-use) token rotation.
-            defer { self.inFlightRefresh = nil }
-            return try await self.performRefresh()
-        }
-        inFlightRefresh = task
-        return try await task.value
-    }
-
-    /// Re-reads current credentials (so a token Claude Code already rotated is used),
-    /// exchanges the refresh token, and persists the rotated set.
-    private func performRefresh() async throws -> ClaudeCredentials {
-        let current = try await load()
-
-        var request = URLRequest(url: Self.refreshURL)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: String] = [
-            "grant_type": "refresh_token",
-            "refresh_token": current.refreshToken,
-            "client_id": Self.clientID,
-            "scope": Self.scope,
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let (data, http) = try await transport.send(request)
-        guard (200..<300).contains(http.statusCode) else {
-            throw CredentialError.refreshFailed(
-                status: http.statusCode,
-                message: String(data: data, encoding: .utf8) ?? ""
-            )
-        }
-
-        let parsed: RefreshResponse
-        do {
-            parsed = try JSONDecoder().decode(RefreshResponse.self, from: data)
-        } catch {
-            throw CredentialError.decodingFailed("\(error)")
-        }
-
-        let newCredentials = ClaudeCredentials(
-            accessToken: parsed.accessToken,
-            refreshToken: parsed.refreshToken,
-            expiresAt: Int(now().timeIntervalSince1970 * 1000) + parsed.expiresIn * 1000
-        )
-        // Cache first so the rotated token is usable even if the Keychain write-back fails.
-        cachedCredentials = newCredentials
-        do {
-            try await persist(newCredentials)
-        } catch {
-            // Non-fatal: the refresh succeeded and we hold a valid token in memory, so the app
-            // still shows usage. The cache (fresher than the stale Keychain) serves later reads.
-            // Log the failure only — never the credentials themselves.
-            fputs("[ClaudeUsage] Keychain write-back failed; using refreshed token in memory: \(error)\n", stderr)
-        }
-        return newCredentials
-    }
-
-    /// Write credentials to the Keychain via the `security` CLI. The secret JSON is fed over
-    /// **stdin** (trailing `-w` with no inline value), so the access/refresh tokens never appear
-    /// in the process argument list where any same-user process could read them.
-    ///
-    /// `add-generic-password -w` with no inline value prompts for the password and a "retype"
-    /// confirmation, reading both from stdin — so the (single-line) JSON is sent twice, one line
-    /// each. Keeping the `security` CLI as the accessor preserves the existing Keychain ACL
-    /// (no new approval prompt), versus switching to the in-process SecItem APIs.
-    func persist(_ credentials: ClaudeCredentials) async throws {
-        let envelope = CredentialsEnvelope(claudeAiOauth: credentials)
-        let data = try JSONEncoder().encode(envelope)
-        let json = String(data: data, encoding: .utf8) ?? "{}"
-        let stdin = "\(json)\n\(json)\n"
-        _ = try await runCommand("/usr/bin/security", [
-            "add-generic-password", "-U",
-            "-a", Self.keychainAccount,
-            "-s", Self.keychainService,
-            "-w",
-        ], stdin: stdin)
-    }
-
-    // MARK: TokenProvider
-
-    public func validAccessToken() async throws -> String {
-        // Fast path: a still-valid cached token skips the `security` subprocess entirely, so the
-        // 60s poll only touches the Keychain when the token is actually near expiry. This also
-        // avoids a Keychain access prompt on every tick.
-        if let cached = cachedCredentials, !isExpired(cached, now: now()) {
-            return cached.accessToken
-        }
-        let credentials = try await load()
-        if isExpired(credentials, now: now()) {
-            return try await refresh().accessToken
-        }
-        return credentials.accessToken
-    }
-
-    public func forceRefreshAccessToken() async throws -> String {
-        try await refresh().accessToken
-    }
-}
-
-/// OAuth token-refresh response.
-struct RefreshResponse: Decodable {
-    let accessToken: String
-    let refreshToken: String
-    let expiresIn: Int
-
-    enum CodingKeys: String, CodingKey {
-        case accessToken = "access_token"
-        case refreshToken = "refresh_token"
-        case expiresIn = "expires_in"
     }
 }

@@ -1,6 +1,11 @@
 import Foundation
 
 public enum UsageError: Error, Equatable {
+    /// The stored access token is expired; we deliberately don't refresh (read-only), so there's
+    /// nothing valid to send. Resolves on its own once Claude Code refreshes its token.
+    case tokenExpired
+    /// The server rejected the (non-expired) token with a 401. Not retried — refreshing would
+    /// consume Claude Code's single-use rotating refresh token.
     case unauthorized
     case http(status: Int, body: String)
     case decoding(String)
@@ -11,8 +16,10 @@ public protocol UsageFetching: Sendable {
     func fetchUsage() async throws -> ClaudeUsage
 }
 
-/// Queries `GET https://api.anthropic.com/api/oauth/usage` with the OAuth headers the
-/// Claude Code CLI uses, retrying once with a refreshed token on a 401.
+/// Queries `GET https://api.anthropic.com/api/oauth/usage` with the OAuth headers the Claude
+/// Code CLI uses. Read-only: it sends only a non-expired stored token and never refreshes — a
+/// 401 or an expired token is surfaced as an error for the caller to show as stale, never turned
+/// into a token refresh (which would consume Claude Code's rotating refresh token).
 public final class UsageClient: UsageFetching, @unchecked Sendable {
     public static let endpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
@@ -31,13 +38,12 @@ public final class UsageClient: UsageFetching, @unchecked Sendable {
     }
 
     public func fetchUsage() async throws -> ClaudeUsage {
-        let token = try await tokenProvider.validAccessToken()
-        var (data, response) = try await transport.send(makeRequest(token: token))
+        let snapshot = try await tokenProvider.currentToken()
+        // Don't even hit the API with a known-expired token — there's no refresh to fall back on,
+        // and a dead token presents nothing useful. Surface it as stale and wait for Claude Code.
+        guard !snapshot.isExpired else { throw UsageError.tokenExpired }
 
-        if response.statusCode == 401 {
-            let refreshed = try await tokenProvider.forceRefreshAccessToken()
-            (data, response) = try await transport.send(makeRequest(token: refreshed))
-        }
+        let (data, response) = try await transport.send(makeRequest(token: snapshot.accessToken))
 
         guard (200..<300).contains(response.statusCode) else {
             if response.statusCode == 401 { throw UsageError.unauthorized }
