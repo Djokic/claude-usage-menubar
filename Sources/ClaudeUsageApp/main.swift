@@ -1,8 +1,8 @@
 import AppKit
 import Foundation
 
-// Ignore SIGPIPE so writing a secret to a subprocess (the `security` CLI) whose read end has
-// already closed fails the syscall as EPIPE (caught locally) instead of terminating the app.
+// Ignore SIGPIPE defensively: a write to a socket/pipe whose peer has closed should fail the
+// syscall as EPIPE (handled locally) rather than terminate this background agent.
 signal(SIGPIPE, SIG_IGN)
 
 // Headless verification path: render sample ring icons to PNGs and exit (no UI).

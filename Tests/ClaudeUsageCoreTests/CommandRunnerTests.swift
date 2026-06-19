@@ -3,13 +3,6 @@ import Foundation
 @testable import ClaudeUsageCore
 
 @Suite struct CommandRunnerTests {
-    // Covers R3: stdin is delivered to the child process.
-    @Test func deliversStdinToProcess() throws {
-        let runner = ProcessCommandRunner()
-        let output = try runner.run("/bin/cat", [], stdin: "hello stdin")
-        #expect(output == "hello stdin")
-    }
-
     @Test func returnsStdoutForZeroExit() throws {
         let runner = ProcessCommandRunner()
         let output = try runner.run("/bin/echo", ["-n", "ok"])
@@ -54,11 +47,5 @@ import Foundation
             try runner.run("/bin/sh", ["-c", "trap '' TERM; sleep 5"])
         }
         #expect(Date().timeIntervalSince(start) < 5)
-    }
-
-    @Test func worksWithoutStdin() throws {
-        let runner = ProcessCommandRunner()
-        let output = try runner.run("/bin/echo", ["-n", "no-stdin"], stdin: nil)
-        #expect(output == "no-stdin")
     }
 }

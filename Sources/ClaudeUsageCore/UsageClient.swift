@@ -61,6 +61,9 @@ public final class UsageClient: UsageFetching, @unchecked Sendable {
     private func makeRequest(token: String) -> URLRequest {
         var request = URLRequest(url: Self.endpoint)
         request.httpMethod = "GET"
+        // Cap below the 60s poll interval so a hung connection can't occupy a poll slot until the
+        // next tick fires on top of it.
+        request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "accept")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")

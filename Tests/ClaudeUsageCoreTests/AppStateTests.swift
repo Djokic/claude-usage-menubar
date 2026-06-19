@@ -61,6 +61,28 @@ import Foundation
 
         await state.refresh()
         #expect(state.phase == .stale)
+        #expect(state.errorMessage?.contains("Claude Code") == true)
+    }
+
+    // A hard credential error (e.g. Keychain read failure) must NOT be misclassified as stale.
+    @Test func commandFailedBecomesHardError() async {
+        let client = FakeUsageClient(result: .success(.sample(fiveHour: 40)))
+        let state = AppState(client: client, lastUsageStore: tempStore())
+
+        await state.refresh()                       // seed good data
+        client.result = .failure(CredentialError.commandFailed(status: 1, message: "denied"))
+        await state.refresh()
+
+        #expect(state.phase == .error)               // not .stale
+        #expect(state.usage?.fiveHour?.utilization == 40)  // fail-soft retains data
+        #expect(state.errorMessage?.contains("Keychain") == true)
+    }
+
+    // With nothing persisted, launch starts idle (no stale data shown).
+    @Test func launchesIdleWhenStoreEmpty() {
+        let state = AppState(client: FakeUsageClient(result: .success(.sample())), lastUsageStore: tempStore())
+        #expect(state.phase == .idle)
+        #expect(state.usage == nil)
     }
 
     @Test func notAuthenticatedWithNoUsageIsStaleWithSignInMessage() async {
