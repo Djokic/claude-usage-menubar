@@ -94,7 +94,7 @@ public final class AppState: ObservableObject {
         switch error {
         case let credentialError as CredentialError:
             // Every credential error carries actionable text via LocalizedError.
-            return credentialError.errorDescription ?? "Couldn't access your Claude credentials."
+            return credentialError.localizedDescription
         case UsageError.unauthorized:
             return "Authorization failed — sign in to Claude Code again"
         case let UsageError.http(status, _):

@@ -161,6 +161,20 @@ import Foundation
         #expect(token == "slow-but-ok")
     }
 
+    // Efficiency: a still-valid cached token short-circuits validAccessToken without a Keychain read.
+    @Test func validAccessTokenFastPathSkipsKeychainWhenCacheFresh() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let nowMs = Int(fixedNow.timeIntervalSince1970 * 1000)
+        let runner = FakeCommandRunner { _, _, _ in self.blob(access: "fresh", expiresAt: nowMs + 60 * 60 * 1000) }
+        let store = CredentialStore(runner: runner, transport: FakeTransport(), now: { fixedNow })
+
+        _ = try await store.validAccessToken()          // seeds the cache (one security read)
+        let callsAfterSeed = runner.calls.count
+        let token = try await store.validAccessToken()  // fast path: no further security call
+        #expect(token == "fresh")
+        #expect(runner.calls.count == callsAfterSeed)
+    }
+
     // Covers R1: concurrent refreshes coalesce into a single OAuth POST.
     @Test func concurrentRefreshesCoalesceIntoOnePost() async throws {
         let fixedNow = Date(timeIntervalSince1970: 1_000_000)
