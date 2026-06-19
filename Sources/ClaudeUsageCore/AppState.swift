@@ -90,10 +90,11 @@ public final class AppState: ObservableObject {
         self.timer = timer
     }
 
-    static func describe(_ error: Error) -> String {
+    nonisolated static func describe(_ error: Error) -> String {
         switch error {
-        case CredentialError.notAuthenticated:
-            return "Not signed in to Claude Code"
+        case let credentialError as CredentialError:
+            // Every credential error carries actionable text via LocalizedError.
+            return credentialError.errorDescription ?? "Couldn't access your Claude credentials."
         case UsageError.unauthorized:
             return "Authorization failed — sign in to Claude Code again"
         case let UsageError.http(status, _):

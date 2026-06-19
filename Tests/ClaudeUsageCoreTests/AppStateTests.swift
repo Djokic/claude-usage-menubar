@@ -91,4 +91,23 @@ import Foundation
         state.stop()
         #expect(state.isPolling == false)
     }
+
+    // Covers R3/R4: describe() maps every credential error to actionable text — never "error N".
+    @Test func describeMapsCredentialErrorsToActionableText() {
+        let cases: [CredentialError] = [
+            .notAuthenticated,
+            .commandFailed(status: 1, message: ""),
+            .commandTimedOut,
+            .refreshFailed(status: 401, message: ""),
+            .decodingFailed("x"),
+        ]
+        for error in cases {
+            let text = AppState.describe(error)
+            #expect(!text.contains("CredentialError"))
+            #expect(!text.lowercased().contains("error 1"))
+            #expect(text.contains("Claude Code") || text.contains("Keychain"))
+        }
+        // UsageError mapping unchanged.
+        #expect(AppState.describe(UsageError.http(status: 500, body: "")).contains("500"))
+    }
 }
