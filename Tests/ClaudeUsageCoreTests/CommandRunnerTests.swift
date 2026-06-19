@@ -3,6 +3,12 @@ import Foundation
 @testable import ClaudeUsageCore
 
 @Suite struct CommandRunnerTests {
+    @Test func deliversStdinToProcess() throws {
+        let runner = ProcessCommandRunner()
+        let output = try runner.run("/bin/cat", [], stdin: "hello stdin")
+        #expect(output == "hello stdin")
+    }
+
     @Test func returnsStdoutForZeroExit() throws {
         let runner = ProcessCommandRunner()
         let output = try runner.run("/bin/echo", ["-n", "ok"])

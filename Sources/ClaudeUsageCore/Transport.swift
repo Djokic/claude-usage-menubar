@@ -1,6 +1,7 @@
 import Foundation
 
-/// Minimal async HTTP seam so the usage client can be tested without hitting the network.
+/// Minimal async HTTP seam so the usage client and credential refresh can be tested
+/// without hitting the network.
 public protocol HTTPTransport: Sendable {
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
 }
@@ -21,12 +22,19 @@ public struct URLSessionTransport: HTTPTransport {
     }
 }
 
-/// Seam for running an external command (used to read the Keychain via the `security` CLI),
-/// injectable for tests.
+/// Seam for running an external command (used to read and write the Keychain via the
+/// `security` CLI), injectable for tests.
 public protocol CommandRunner: Sendable {
-    /// Run `executable` with `arguments`, returning stdout. Throws `commandFailed` on a non-zero
-    /// exit, `commandTimedOut` on a hang.
-    func run(_ executable: String, _ arguments: [String]) throws -> String
+    /// Run `executable` with `arguments`, optionally writing `stdin` to its standard input,
+    /// returning stdout. Throws `commandFailed` on a non-zero exit, `commandTimedOut` on a hang.
+    func run(_ executable: String, _ arguments: [String], stdin: String?) throws -> String
+}
+
+public extension CommandRunner {
+    /// Convenience for commands that take no stdin (e.g. the Keychain read).
+    func run(_ executable: String, _ arguments: [String]) throws -> String {
+        try run(executable, arguments, stdin: nil)
+    }
 }
 
 public struct ProcessCommandRunner: CommandRunner {
@@ -38,20 +46,29 @@ public struct ProcessCommandRunner: CommandRunner {
         self.timeout = timeout
     }
 
-    public func run(_ executable: String, _ arguments: [String]) throws -> String {
+    public func run(_ executable: String, _ arguments: [String], stdin: String?) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
 
         let outPipe = Pipe()
         let errPipe = Pipe()
+        let inPipe = Pipe()
         process.standardOutput = outPipe
         process.standardError = errPipe
+        process.standardInput = inPipe
 
         let exited = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in exited.signal() }
 
         try process.run()
+
+        // Feed stdin (e.g. a secret) then close so the child sees EOF. Passing secrets via
+        // stdin keeps them out of the process argument list (visible to other processes).
+        if let stdin, let data = stdin.data(using: .utf8) {
+            try? inPipe.fileHandleForWriting.write(contentsOf: data)
+        }
+        try? inPipe.fileHandleForWriting.close()
 
         // Drain stdout and stderr concurrently — reading one to completion before the other
         // can deadlock if the child fills the second pipe's buffer.

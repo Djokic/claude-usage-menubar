@@ -7,6 +7,7 @@ import Foundation
         .notAuthenticated,
         .commandFailed(status: 44, message: "item not found"),
         .commandTimedOut,
+        .refreshFailed(status: 401, message: "bad token"),
         .decodingFailed("boom"),
     ]
 
