@@ -26,10 +26,15 @@ enum ISO8601 {
         }
         return nil
     }
+
+    /// Serialize a date back to the API's whole-second format (used when persisting usage).
+    static func string(from date: Date) -> String {
+        noFraction.string(from: date)
+    }
 }
 
 /// A single usage window (e.g. the rolling 5-hour or 7-day limit).
-public struct UsageWindow: Decodable, Equatable, Sendable {
+public struct UsageWindow: Codable, Equatable, Sendable {
     /// Usage percentage, 0–100.
     public let utilization: Double
     /// When this window resets.
@@ -58,10 +63,18 @@ public struct UsageWindow: Decodable, Equatable, Sendable {
         }
         resetsAt = parsed
     }
+
+    /// Encode `resetsAt` as the same ISO-8601 string the decoder reads, so a persisted snapshot
+    /// round-trips through `init(from:)` regardless of the encoder's date strategy.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(utilization, forKey: .utilization)
+        try container.encode(ISO8601.string(from: resetsAt), forKey: .resetsAt)
+    }
 }
 
 /// Paid extra-usage credits (add-on), when enabled.
-public struct ExtraUsage: Decodable, Equatable, Sendable {
+public struct ExtraUsage: Codable, Equatable, Sendable {
     public let isEnabled: Bool
     public let monthlyLimit: Double?
     public let usedCredits: Double?
@@ -86,7 +99,7 @@ public struct ExtraUsage: Decodable, Equatable, Sendable {
 ///
 /// Each window is optional — the API returns `null` for windows that are not
 /// active for this account. The obfuscated `iguana_necktie` field is ignored.
-public struct ClaudeUsage: Decodable, Equatable, Sendable {
+public struct ClaudeUsage: Codable, Equatable, Sendable {
     /// Rolling 5-hour limit (the "current session"). Drives the outer ring.
     public let fiveHour: UsageWindow?
     /// Rolling 7-day limit (all models). Drives the inner ring.
