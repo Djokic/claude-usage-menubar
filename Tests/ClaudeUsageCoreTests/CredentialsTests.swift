@@ -341,7 +341,7 @@ import Foundation
         #expect(json["refresh_token"] == "rotated-1")
     }
 
-    // Covers R4: corrupt Keychain JSON still surfaces decodingFailed (not masked by cache/fallback).
+    // Covers R4: corrupt Keychain JSON surfaces decodingFailed when there's no cached token to fall back on.
     @Test func decodingFailedFromKeychainStillThrowsAndIsNotMasked() async throws {
         let runner = FakeCommandRunner { _, _, _ in "not json at all" }
         let store = CredentialStore(runner: runner, transport: FakeTransport(), fallbackFileURL: nonexistentFallback())
@@ -351,5 +351,47 @@ import Foundation
             Issue.record("expected decodingFailed, got \(String(describing: thrown))")
             return
         }
+    }
+
+    // Covers R2: equal expiresAt is a tie — the Keychain wins (cache only wins when strictly newer).
+    @Test func cacheFreshestTieGoesToKeychain() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let nowMs = Int(fixedNow.timeIntervalSince1970 * 1000)
+        let runner = FakeCommandRunner()
+        runner.handler = { _, _, _ in self.blob(access: "cache-A", expiresAt: nowMs + 5000) }
+        let store = CredentialStore(runner: runner, transport: FakeTransport(), now: { fixedNow })
+        _ = try await store.load()   // seed cache with A @ +5000
+
+        runner.handler = { _, _, _ in self.blob(access: "keychain-B", expiresAt: nowMs + 5000) }  // same expiresAt
+        let loaded = try await store.load()
+        #expect(loaded.accessToken == "keychain-B")
+    }
+
+    // Covers R2/R4: a non-CredentialError Keychain read failure also falls back to the cache.
+    @Test func loadFallsBackToCacheOnNonCredentialError() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let nowMs = Int(fixedNow.timeIntervalSince1970 * 1000)
+        let runner = FakeCommandRunner()
+        runner.handler = { _, _, _ in self.blob(access: "cached", expiresAt: nowMs + 9999) }
+        let store = CredentialStore(runner: runner, transport: FakeTransport(), now: { fixedNow })
+        _ = try await store.load()   // seed cache
+
+        runner.handler = { _, _, _ in throw TestError.boom }   // non-CredentialError failure
+        let loaded = try await store.load()
+        #expect(loaded.accessToken == "cached")
+    }
+
+    // Covers R4: transient corrupt Keychain JSON falls back to a known-good cache instead of hard-failing.
+    @Test func decodingFailedFallsBackToCacheWhenPresent() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let nowMs = Int(fixedNow.timeIntervalSince1970 * 1000)
+        let runner = FakeCommandRunner()
+        runner.handler = { _, _, _ in self.blob(access: "cached", expiresAt: nowMs + 9999) }
+        let store = CredentialStore(runner: runner, transport: FakeTransport(), now: { fixedNow })
+        _ = try await store.load()   // seed cache
+
+        runner.handler = { _, _, _ in "corrupt not json" }
+        let loaded = try await store.load()
+        #expect(loaded.accessToken == "cached")
     }
 }

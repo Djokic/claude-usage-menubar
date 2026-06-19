@@ -32,8 +32,7 @@ public enum CredentialError: Error, Equatable, LocalizedError {
         case .notAuthenticated:
             return "Not signed in to Claude Code. Open Claude Code, sign in, then try again."
         case let .commandFailed(status, _):
-            return "Couldn't read your Claude credentials from the Keychain (security exited \(status)). "
-                + "Make sure Claude Code is installed and allow Keychain access if macOS prompts."
+            return "Couldn't read your Claude credentials from the Keychain (security exited \(status)). Make sure Claude Code is installed and allow Keychain access if macOS prompts."
         case .commandTimedOut:
             return "Keychain access timed out. Try again, and allow access if macOS prompts."
         case let .refreshFailed(status, _):
@@ -116,16 +115,20 @@ public actor CredentialStore: TokenProvider {
             )
             return cacheFreshest(try decodeEnvelope(raw))
         } catch let error as CredentialError {
-            // Decoding errors are real corruption — don't mask them with the cache/fallback.
-            if case .decodingFailed = error { throw error }
+            // Corrupt Keychain JSON: fall back to a known-good cached token if we have one
+            // (a transient truncation shouldn't hard-fail), otherwise surface the corruption.
+            if case .decodingFailed = error {
+                if let cached = cachedCredentials { return cached }
+                throw error
+            }
             // Keychain read failed: prefer an in-memory token (e.g. a rotated one we couldn't
             // persist), then the credentials-file fallback, then surface "not signed in".
             if let cached = cachedCredentials { return cached }
-            if let creds = try loadFromFallbackFile() { return creds }
+            if let creds = try loadFromFallbackFile() { return cacheFreshest(creds) }
             throw CredentialError.notAuthenticated
         } catch {
             if let cached = cachedCredentials { return cached }
-            if let creds = try loadFromFallbackFile() { return creds }
+            if let creds = try loadFromFallbackFile() { return cacheFreshest(creds) }
             throw CredentialError.notAuthenticated
         }
     }
@@ -236,9 +239,7 @@ public actor CredentialStore: TokenProvider {
             // Non-fatal: the refresh succeeded and we hold a valid token in memory, so the app
             // still shows usage. The cache (fresher than the stale Keychain) serves later reads.
             // Log the failure only — never the credentials themselves.
-            try? FileHandle.standardError.write(
-                contentsOf: Data("[ClaudeUsage] Keychain write-back failed; using refreshed token in memory: \(error)\n".utf8)
-            )
+            fputs("[ClaudeUsage] Keychain write-back failed; using refreshed token in memory: \(error)\n", stderr)
         }
         return newCredentials
     }
