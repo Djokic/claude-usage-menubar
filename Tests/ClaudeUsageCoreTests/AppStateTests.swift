@@ -3,11 +3,18 @@ import Foundation
 @testable import ClaudeUsageCore
 
 @Suite @MainActor struct AppStateTests {
-    // Covers R8 (manual refresh success path).
+    /// A store backed by a throwaway temp file so tests never touch the real Application Support
+    /// copy. Each call is a fresh, empty location unless explicitly seeded.
+    private func tempStore() -> LastUsageStore {
+        LastUsageStore(fileURL: FileManager.default.temporaryDirectory
+            .appendingPathComponent("appstate-tests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("last-usage.json"))
+    }
+
     @Test func refreshSuccessTransitionsToLoaded() async {
         let client = FakeUsageClient(result: .success(.sample(fiveHour: 42, sevenDay: 7)))
         let fixedNow = Date(timeIntervalSince1970: 5_000_000)
-        let state = AppState(client: client, now: { fixedNow })
+        let state = AppState(client: client, lastUsageStore: tempStore(), now: { fixedNow })
 
         await state.refresh()
 
@@ -18,25 +25,99 @@ import Foundation
         #expect(state.errorMessage == nil)
     }
 
-    @Test func refreshFailureRetainsPreviousUsage() async {
+    // Hard errors (e.g. HTTP 5xx) stay fail-soft: keep previous usage, surface an error.
+    @Test func hardErrorRetainsPreviousUsageAsError() async {
         let client = FakeUsageClient(result: .success(.sample(fiveHour: 30)))
-        let state = AppState(client: client)
+        let state = AppState(client: client, lastUsageStore: tempStore())
 
         await state.refresh()                       // seed good data
         #expect(state.usage?.fiveHour?.utilization == 30)
 
-        client.result = .failure(UsageError.unauthorized)
-        await state.refresh()                       // now fails
+        client.result = .failure(UsageError.http(status: 500, body: ""))
+        await state.refresh()
 
         #expect(state.phase == .error)
         #expect(state.errorMessage != nil)
         #expect(state.usage?.fiveHour?.utilization == 30)  // fail-soft: previous data kept
     }
 
-    // Covers R7: polling performs an immediate fetch and schedules the repeat.
+    // Token expiry is a soft stale state, not an error — usage is retained, no refresh attempted.
+    @Test func unauthorizedBecomesStaleRetainingUsage() async {
+        let client = FakeUsageClient(result: .success(.sample(fiveHour: 55)))
+        let state = AppState(client: client, lastUsageStore: tempStore())
+
+        await state.refresh()                       // seed good data
+        client.result = .failure(UsageError.unauthorized)
+        await state.refresh()
+
+        #expect(state.phase == .stale)
+        #expect(state.usage?.fiveHour?.utilization == 55)  // last-known retained
+        #expect(state.errorMessage?.contains("Claude Code") == true)
+    }
+
+    @Test func tokenExpiredBecomesStale() async {
+        let client = FakeUsageClient(result: .failure(UsageError.tokenExpired))
+        let state = AppState(client: client, lastUsageStore: tempStore())
+
+        await state.refresh()
+        #expect(state.phase == .stale)
+    }
+
+    @Test func notAuthenticatedWithNoUsageIsStaleWithSignInMessage() async {
+        let client = FakeUsageClient(result: .failure(CredentialError.notAuthenticated))
+        let state = AppState(client: client, lastUsageStore: tempStore())
+
+        await state.refresh()
+        #expect(state.phase == .stale)
+        #expect(state.usage == nil)
+        #expect(state.errorMessage?.lowercased().contains("sign in") == true)
+    }
+
+    // Recovery: a stale tick followed by a good fetch returns to loaded.
+    @Test func recoversFromStaleToLoaded() async {
+        let client = FakeUsageClient(result: .failure(UsageError.tokenExpired))
+        let state = AppState(client: client, lastUsageStore: tempStore())
+
+        await state.refresh()
+        #expect(state.phase == .stale)
+
+        client.result = .success(.sample(fiveHour: 12))
+        await state.refresh()
+        #expect(state.phase == .loaded)
+        #expect(state.usage?.fiveHour?.utilization == 12)
+    }
+
+    // Launch shows real last-known data immediately from the persisted store.
+    @Test func launchLoadsPersistedUsageImmediately() async {
+        let store = tempStore()
+        let savedAt = Date(timeIntervalSince1970: 4_000_000)
+        store.save(.sample(fiveHour: 77, sevenDay: 11), at: savedAt)
+
+        let client = FakeUsageClient(result: .failure(UsageError.tokenExpired))
+        let state = AppState(client: client, lastUsageStore: store)
+
+        // Populated before any network call.
+        #expect(state.usage?.fiveHour?.utilization == 77)
+        #expect(state.lastUpdated == savedAt)
+        #expect(state.phase == .stale)
+    }
+
+    // A successful fetch persists usage so a later launch can restore it.
+    @Test func successPersistsUsageToStore() async {
+        let store = tempStore()
+        let client = FakeUsageClient(result: .success(.sample(fiveHour: 64, sevenDay: 9)))
+        let state = AppState(client: client, lastUsageStore: store)
+
+        await state.refresh()
+
+        let restored = store.load()
+        #expect(restored?.usage.fiveHour?.utilization == 64)
+        #expect(restored?.usage.sevenDay?.utilization == 9)
+    }
+
     @Test func startPollingFetchesImmediatelyAndSchedules() async {
         let client = FakeUsageClient(result: .success(.sample()))
-        let state = AppState(client: client)
+        let state = AppState(client: client, lastUsageStore: tempStore())
 
         state.startPolling()
         await state.lastRefreshTask?.value
@@ -46,10 +127,9 @@ import Foundation
         #expect(state.phase == .loaded)
     }
 
-    // Covers R8: manual refresh triggers another fetch and keeps polling active.
     @Test func manualRefreshFetchesAgain() async {
         let client = FakeUsageClient(result: .success(.sample()))
-        let state = AppState(client: client)
+        let state = AppState(client: client, lastUsageStore: tempStore())
 
         state.startPolling()
         await state.lastRefreshTask?.value
@@ -62,9 +142,9 @@ import Foundation
 
     @Test func pollTickPerformsFetch() async {
         let client = FakeUsageClient(result: .success(.sample()))
-        let state = AppState(client: client)
+        let state = AppState(client: client, lastUsageStore: tempStore())
 
-        state.pollTick()               // simulates the timer firing
+        state.pollTick()
         await state.lastRefreshTask?.value
 
         #expect(client.callCount == 1)
@@ -72,10 +152,10 @@ import Foundation
 
     @Test func overlappingRefreshesResolveConsistently() async {
         let client = FakeUsageClient(result: .success(.sample()))
-        let state = AppState(client: client)
+        let state = AppState(client: client, lastUsageStore: tempStore())
 
         state.manualRefresh()
-        state.manualRefresh()          // cancels the first in-flight task
+        state.manualRefresh()
         await state.lastRefreshTask?.value
 
         #expect(state.phase == .loaded)
@@ -84,7 +164,7 @@ import Foundation
 
     @Test func stopEndsPolling() async {
         let client = FakeUsageClient(result: .success(.sample()))
-        let state = AppState(client: client)
+        let state = AppState(client: client, lastUsageStore: tempStore())
         state.startPolling()
         await state.lastRefreshTask?.value
 
@@ -92,13 +172,12 @@ import Foundation
         #expect(state.isPolling == false)
     }
 
-    // Covers R3/R4: describe() maps every credential error to actionable text — never "error N".
+    // describe() maps errors to actionable text — never "error N".
     @Test func describeMapsCredentialErrorsToActionableText() {
         let cases: [CredentialError] = [
             .notAuthenticated,
             .commandFailed(status: 1, message: ""),
             .commandTimedOut,
-            .refreshFailed(status: 401, message: ""),
             .decodingFailed("x"),
         ]
         for error in cases {
@@ -107,7 +186,10 @@ import Foundation
             #expect(!text.lowercased().contains("error 1"))
             #expect(text.contains("Claude Code") || text.contains("Keychain"))
         }
-        // UsageError mapping unchanged.
         #expect(AppState.describe(UsageError.http(status: 500, body: "")).contains("500"))
+        #expect(AppState.isStale(UsageError.tokenExpired))
+        #expect(AppState.isStale(UsageError.unauthorized))
+        #expect(AppState.isStale(CredentialError.notAuthenticated))
+        #expect(!AppState.isStale(UsageError.http(status: 500, body: "")))
     }
 }
