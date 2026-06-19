@@ -19,12 +19,29 @@ struct CredentialsEnvelope: Codable {
     var claudeAiOauth: ClaudeCredentials
 }
 
-public enum CredentialError: Error, Equatable {
+public enum CredentialError: Error, Equatable, LocalizedError {
     case notAuthenticated
     case commandFailed(status: Int32, message: String)
     case commandTimedOut
     case refreshFailed(status: Int, message: String)
     case decodingFailed(String)
+
+    /// Human, actionable text shown in the UI — never a raw "CredentialError error N".
+    public var errorDescription: String? {
+        switch self {
+        case .notAuthenticated:
+            return "Not signed in to Claude Code. Open Claude Code, sign in, then try again."
+        case let .commandFailed(status, _):
+            return "Couldn't read your Claude credentials from the Keychain (security exited \(status)). "
+                + "Make sure Claude Code is installed and allow Keychain access if macOS prompts."
+        case .commandTimedOut:
+            return "Keychain access timed out. Try again, and allow access if macOS prompts."
+        case let .refreshFailed(status, _):
+            return "Couldn't refresh your Claude session (HTTP \(status)). Sign in to Claude Code again."
+        case .decodingFailed:
+            return "Couldn't read the stored Claude credentials. Sign in to Claude Code again."
+        }
+    }
 }
 
 /// Abstraction so the usage client can obtain a usable access token (refreshing if needed)
