@@ -235,6 +235,30 @@ import Foundation
         #expect(!runner.calls.contains { $0.arguments.contains(where: { $0.contains("rotated-secret") }) })  // never in argv
     }
 
+    // The rotated write-back must preserve every field Claude Code stored (scopes, subscriptionType,
+    // …) — only the three rotating fields change. A lossy 3-field re-encode would corrupt the CLI's
+    // credential.
+    @Test func refreshPreservesExtraKeychainFields() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let richBlob = """
+        {"claudeAiOauth":{"accessToken":"old-acc","refreshToken":"old-ref","expiresAt":\(pastExpiry(fixedNow)),"scopes":["a","b"],"subscriptionType":"max"}}
+        """
+        let runner = FakeCommandRunner { _, args in
+            args.first == "find-generic-password" ? richBlob : ""
+        }
+        let refreshJSON = #"{"access_token":"new-acc","refresh_token":"new-ref","expires_in":3600}"#.data(using: .utf8)!
+        let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow }, writeAccessStore: writeStore(granted: true))
+
+        _ = try await store.refresh()
+        let written = try #require(runner.lastWriteStdin)
+        #expect(written.contains("new-acc"))         // rotating fields updated
+        #expect(written.contains("new-ref"))
+        #expect(written.contains("subscriptionType"))  // preserved
+        #expect(written.contains("\"scopes\""))        // preserved
+        #expect(!written.contains("old-acc"))          // old token replaced
+    }
+
     @Test func concurrentRefreshesCoalesceIntoOnePost() async throws {
         let fixedNow = Date(timeIntervalSince1970: 1_000_000)
         let runner = FakeCommandRunner { _, args in
