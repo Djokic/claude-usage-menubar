@@ -80,11 +80,18 @@ $BIN --render-tooltip /tmp/tip.png # render the tooltip popover to a PNG
 If `--once` prints `FETCH FAILED`, make sure you're signed in to Claude Code (`claude`),
 then allow Keychain access when macOS prompts.
 
+The app is **read-only**: it shows whatever token Claude Code currently holds and never
+refreshes it — refreshing would consume Claude Code's single-use rotating token and log it
+out. If the popover says *"open Claude Code to refresh"*, the stored token has simply expired;
+use Claude Code once and the menu bar picks up the fresh token automatically. If you upgraded
+from an older build (which did refresh) and Claude Code now asks you to sign in, re-login once
+with `claude` — it won't recur.
+
 ## How it works
 
 | Piece | What it does |
 |-------|--------------|
-| `ClaudeUsageCore` | Pure, unit-tested logic: models, Keychain credentials + token refresh, usage client, formatting, ring geometry, app state. |
+| `ClaudeUsageCore` | Pure, unit-tested logic: models, **read-only** Keychain credentials, usage client, last-known-usage store, formatting, ring geometry, app state. |
 | `ClaudeUsageApp`  | AppKit/SwiftUI shell: dual-ring `NSImage` renderer, `NSStatusItem` with hover/click popover + right-click menu, SwiftUI tooltip. |
 
 See `docs/plans/` for the full implementation plan, and
@@ -110,6 +117,8 @@ This is a personal/power-user tool, best shared as a **directly distributed** ap
 ## Limitations
 
 - Uses an **undocumented** Claude OAuth usage endpoint; it may change or break without notice.
-- Reuses Claude Code's Keychain credentials (and refreshes the shared OAuth token), so it
-  depends on Claude Code being installed and signed in.
+- Reads Claude Code's Keychain credentials **read-only** — it never refreshes the shared OAuth
+  token, so it can't log Claude Code out. It depends on Claude Code being installed and signed
+  in; when the token is idle long enough to expire, usage shows as last-known until you next use
+  Claude Code.
 - Launch-at-login, a preferences window, and per-model breakdown rows are deferred follow-ups.
