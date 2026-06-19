@@ -86,8 +86,7 @@ public actor CredentialStore: TokenProvider {
         self.fallbackFileURL = fallbackFileURL
     }
 
-    /// Freshest credentials seen this session. Lets a refresh whose Keychain write-back failed
-    /// still serve (and re-use) the rotated token instead of falling back to the stale Keychain.
+    /// Holds the rotated token so a failed Keychain write-back doesn't revert to a stale entry.
     private var cachedCredentials: ClaudeCredentials?
 
     // MARK: Off-actor command execution
@@ -121,16 +120,18 @@ public actor CredentialStore: TokenProvider {
                 if let cached = cachedCredentials { return cached }
                 throw error
             }
-            // Keychain read failed: prefer an in-memory token (e.g. a rotated one we couldn't
-            // persist), then the credentials-file fallback, then surface "not signed in".
-            if let cached = cachedCredentials { return cached }
-            if let creds = try loadFromFallbackFile() { return cacheFreshest(creds) }
-            throw CredentialError.notAuthenticated
+            return try fallbackCredentials()
         } catch {
-            if let cached = cachedCredentials { return cached }
-            if let creds = try loadFromFallbackFile() { return cacheFreshest(creds) }
-            throw CredentialError.notAuthenticated
+            return try fallbackCredentials()
         }
+    }
+
+    /// Keychain read failed: prefer an in-memory token (e.g. a rotated one we couldn't persist),
+    /// then the credentials-file fallback, then surface "not signed in".
+    private func fallbackCredentials() throws -> ClaudeCredentials {
+        if let cached = cachedCredentials { return cached }
+        if let creds = try loadFromFallbackFile() { return cacheFreshest(creds) }
+        throw CredentialError.notAuthenticated
     }
 
     /// Update the cache to the freshest of `credentials` and the current cache (by `expiresAt`)
@@ -268,6 +269,12 @@ public actor CredentialStore: TokenProvider {
     // MARK: TokenProvider
 
     public func validAccessToken() async throws -> String {
+        // Fast path: a still-valid cached token skips the `security` subprocess entirely, so the
+        // 60s poll only touches the Keychain when the token is actually near expiry. This also
+        // avoids a Keychain access prompt on every tick.
+        if let cached = cachedCredentials, !isExpired(cached, now: now()) {
+            return cached.accessToken
+        }
         let credentials = try await load()
         if isExpired(credentials, now: now()) {
             return try await refresh().accessToken
