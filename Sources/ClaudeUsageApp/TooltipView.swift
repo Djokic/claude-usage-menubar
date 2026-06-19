@@ -66,6 +66,11 @@ struct TooltipView: View {
                     Label("Couldn't refresh — showing last data", systemImage: "exclamationmark.triangle")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                } else if state.phase == .stale {
+                    Label(state.errorMessage ?? "Token expired — open Claude Code to refresh",
+                          systemImage: "info.circle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
             }
         } else {
@@ -87,6 +92,15 @@ struct TooltipView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Label(state.errorMessage ?? "Couldn't load usage",
                       systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                Button("Try again") { state.manualRefresh() }
+                    .controlSize(.small)
+            }
+        case .stale:
+            VStack(alignment: .leading, spacing: 8) {
+                Label(state.errorMessage ?? "Open Claude Code to refresh your usage.",
+                      systemImage: "info.circle")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                 Button("Try again") { state.manualRefresh() }

@@ -9,6 +9,9 @@ public final class AppState: ObservableObject {
         case idle
         case loading
         case loaded
+        /// Showing last-known usage because the stored token is expired or absent — not a hard
+        /// error. Recovers automatically on the next tick once Claude Code refreshes its token.
+        case stale
         case error
     }
 
@@ -18,6 +21,7 @@ public final class AppState: ObservableObject {
     @Published public private(set) var errorMessage: String?
 
     private let client: UsageFetching
+    private let lastUsageStore: LastUsageStore
     private let interval: TimeInterval
     private let now: () -> Date
     private var timer: Timer?
@@ -27,10 +31,22 @@ public final class AppState: ObservableObject {
 
     public var isPolling: Bool { timer != nil }
 
-    public init(client: UsageFetching, interval: TimeInterval = 60, now: @escaping () -> Date = Date.init) {
+    public init(
+        client: UsageFetching,
+        lastUsageStore: LastUsageStore = LastUsageStore(),
+        interval: TimeInterval = 60,
+        now: @escaping () -> Date = Date.init
+    ) {
         self.client = client
+        self.lastUsageStore = lastUsageStore
         self.interval = interval
         self.now = now
+        // Show real last-known data immediately on launch, before the first live fetch returns.
+        if let snapshot = lastUsageStore.load() {
+            usage = snapshot.usage
+            lastUpdated = snapshot.savedAt
+            phase = .stale
+        }
     }
 
     /// Fetch immediately and start the repeating poll.
@@ -63,14 +79,29 @@ public final class AppState: ObservableObject {
         phase = .loading
         do {
             let result = try await client.fetchUsage()
+            let stamp = now()
             usage = result
-            lastUpdated = now()
+            lastUpdated = stamp
             errorMessage = nil
             phase = .loaded
+            lastUsageStore.save(result, at: stamp)
         } catch {
-            errorMessage = Self.describe(error)
-            phase = .error
+            if Self.isStale(error) {
+                // Token expired / not signed in: not a hard error. Keep showing last-known usage
+                // and wait for Claude Code to refresh its own token — we never refresh it for them.
+                errorMessage = staleMessage()
+                phase = .stale
+            } else {
+                errorMessage = Self.describe(error)
+                phase = .error
+            }
         }
+    }
+
+    private func staleMessage() -> String {
+        usage == nil
+            ? "Open Claude Code and sign in to see your usage."
+            : "Token expired — open Claude Code to refresh."
     }
 
     private func refreshNow() {
@@ -90,13 +121,24 @@ public final class AppState: ObservableObject {
         self.timer = timer
     }
 
+    /// Errors that mean "the token Claude Code maintains isn't usable right now" — shown as a
+    /// soft stale state (keep last-known usage), never a hard error, and never a refresh trigger.
+    nonisolated static func isStale(_ error: Error) -> Bool {
+        switch error {
+        case UsageError.tokenExpired, UsageError.unauthorized, CredentialError.notAuthenticated:
+            return true
+        default:
+            return false
+        }
+    }
+
     nonisolated static func describe(_ error: Error) -> String {
         switch error {
         case let credentialError as CredentialError:
             // Every credential error carries actionable text via LocalizedError.
             return credentialError.localizedDescription
-        case UsageError.unauthorized:
-            return "Authorization failed — sign in to Claude Code again"
+        case UsageError.tokenExpired, UsageError.unauthorized:
+            return "Your Claude session expired — open Claude Code to refresh it"
         case let UsageError.http(status, _):
             return "Usage request failed (HTTP \(status))"
         case UsageError.decoding:
