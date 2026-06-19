@@ -80,18 +80,24 @@ $BIN --render-tooltip /tmp/tip.png # render the tooltip popover to a PNG
 If `--once` prints `FETCH FAILED`, make sure you're signed in to Claude Code (`claude`),
 then allow Keychain access when macOS prompts.
 
-The app is **read-only**: it shows whatever token Claude Code currently holds and never
-refreshes it — refreshing would consume Claude Code's single-use rotating token and log it
-out. If the popover says *"open Claude Code to refresh"*, the stored token has simply expired;
-use Claude Code once and the menu bar picks up the fresh token automatically. If you upgraded
-from an older build (which did refresh) and Claude Code now asks you to sign in, re-login once
-with `claude` — it won't recur.
+The app is **adaptive**. On first launch it asks macOS for permission to update the
+`Claude Code-credentials` Keychain item (an "allow modify" prompt) — click **Always Allow**:
+
+- **If granted** (it succeeds on most machines), the app refreshes the token near expiry and
+  writes the rotated token back, so the Claude Code CLI stays in sync. You get live usage even
+  when idle.
+- **If denied** (or your machine's Keychain ACL restricts it), the app runs **read-only**: it
+  shows last-known usage with *"open Claude Code to refresh"* once the token expires, and picks
+  up the fresh token automatically the next time you use Claude Code.
+
+Either way it never logs Claude Code out — it only refreshes when it can save the result. If you
+ran an older build that logged you out, re-login once with `claude`; it won't recur.
 
 ## How it works
 
 | Piece | What it does |
 |-------|--------------|
-| `ClaudeUsageCore` | Pure, unit-tested logic: models, **read-only** Keychain credentials, usage client, last-known-usage store, formatting, ring geometry, app state. |
+| `ClaudeUsageCore` | Pure, unit-tested logic: models, **adaptive** Keychain credentials (write-gated refresh, else read-only) with a first-launch write-access probe, usage client, last-known-usage store, formatting, ring geometry, app state. |
 | `ClaudeUsageApp`  | AppKit/SwiftUI shell: dual-ring `NSImage` renderer, `NSStatusItem` with hover/click popover + right-click menu, SwiftUI tooltip. |
 
 See `docs/plans/` for the full implementation plan, and
@@ -117,8 +123,9 @@ This is a personal/power-user tool, best shared as a **directly distributed** ap
 ## Limitations
 
 - Uses an **undocumented** Claude OAuth usage endpoint; it may change or break without notice.
-- Reads Claude Code's Keychain credentials **read-only** — it never refreshes the shared OAuth
-  token, so it can't log Claude Code out. It depends on Claude Code being installed and signed
-  in; when the token is idle long enough to expire, usage shows as last-known until you next use
-  Claude Code.
+- Reads Claude Code's Keychain credentials and, **only where macOS grants write access**,
+  refreshes the shared OAuth token and writes it back (keeping Claude Code in sync); elsewhere it
+  runs read-only and shows last-known usage when the token expires. It never refreshes without
+  being able to save the result, so it can't log Claude Code out. Depends on Claude Code being
+  installed and signed in.
 - Launch-at-login, a preferences window, and per-model breakdown rows are deferred follow-ups.

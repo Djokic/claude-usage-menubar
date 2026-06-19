@@ -19,6 +19,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.state = state
             self.controller = controller
 
+            // Surface the one-time Keychain write-access prompt on first launch so we learn
+            // whether this machine lets us refresh (and keep Claude Code in sync) or must stay
+            // read-only. The result is persisted; the prompt never reappears.
+            Task { await credentialStore.ensureWriteAccessProbed() }
             state.startPolling()
         }
     }
