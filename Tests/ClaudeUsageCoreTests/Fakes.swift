@@ -14,15 +14,6 @@ final class FakeCommandRunner: CommandRunner, @unchecked Sendable {
         calls.append((executable, arguments, stdin))
         return try handler(executable, arguments, stdin)
     }
-
-    private var lastPersistCall: (executable: String, arguments: [String], stdin: String?)? {
-        calls.last(where: { $0.arguments.first == "add-generic-password" })
-    }
-
-    /// The last `add-generic-password` (persist) call's arguments, if any.
-    var lastPersistArguments: [String]? { lastPersistCall?.arguments }
-    /// The stdin fed to the last persist call (where the secret now travels).
-    var lastPersistStdin: String? { lastPersistCall?.stdin }
 }
 
 /// Returns queued HTTP responses (or throws), recording the requests it received.
@@ -62,28 +53,22 @@ final class FakeTransport: HTTPTransport, @unchecked Sendable {
     }
 }
 
-/// Token provider stub for the usage-client tests.
+/// Read-only token-provider stub for the usage-client tests.
 final class FakeTokenProvider: TokenProvider, @unchecked Sendable {
     var token: String
-    var refreshedToken: String
-    var validError: Error?
-    private(set) var validCalls = 0
-    private(set) var refreshCalls = 0
+    var isExpired: Bool
+    var error: Error?
+    private(set) var calls = 0
 
-    init(token: String, refreshedToken: String = "refreshed-token") {
+    init(token: String, isExpired: Bool = false) {
         self.token = token
-        self.refreshedToken = refreshedToken
+        self.isExpired = isExpired
     }
 
-    func validAccessToken() async throws -> String {
-        validCalls += 1
-        if let validError { throw validError }
-        return token
-    }
-
-    func forceRefreshAccessToken() async throws -> String {
-        refreshCalls += 1
-        return refreshedToken
+    func currentToken() async throws -> TokenSnapshot {
+        calls += 1
+        if let error { throw error }
+        return TokenSnapshot(accessToken: token, isExpired: isExpired)
     }
 }
 

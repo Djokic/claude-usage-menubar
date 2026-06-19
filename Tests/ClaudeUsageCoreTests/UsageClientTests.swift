@@ -8,7 +8,7 @@ import Foundation
      "seven_day":{"utilization":3,"resets_at":"2026-06-23T13:00:00Z"}}
     """.data(using: .utf8)!
 
-    // Covers R6: request shape and headers.
+    // Request shape and headers.
     @Test func sendsGetWithExactHeaders() async throws {
         let transport = FakeTransport(stubs: [.init(Self.sampleJSON, 200)])
         let client = UsageClient(
@@ -36,33 +36,26 @@ import Foundation
         #expect(usage.sevenDay?.utilization == 3)
     }
 
-    @Test func refreshesOnceAndRetriesAfter401() async throws {
-        let transport = FakeTransport(stubs: [
-            .init(Data(), 401),
-            .init(Self.sampleJSON, 200),
-        ])
-        let provider = FakeTokenProvider(token: "stale", refreshedToken: "fresh")
+    // Expired stored token: throws tokenExpired WITHOUT hitting the API (no refresh exists).
+    @Test func expiredTokenThrowsWithoutHittingApi() async throws {
+        let transport = FakeTransport(stubs: [.init(Self.sampleJSON, 200)])
+        let provider = FakeTokenProvider(token: "stale", isExpired: true)
         let client = UsageClient(tokenProvider: provider, transport: transport)
 
-        let usage = try await client.fetchUsage()
-        #expect(usage.fiveHour?.utilization == 19)
-        #expect(provider.refreshCalls == 1)
-        #expect(transport.requests.count == 2)
-        #expect(transport.requests[1].value(forHTTPHeaderField: "authorization") == "Bearer fresh")
+        await #expect(throws: UsageError.tokenExpired) { try await client.fetchUsage() }
+        #expect(transport.requests.isEmpty)  // never called the server with a dead token
+        #expect(provider.calls == 1)
     }
 
-    @Test func throwsUnauthorizedWhenSecond401() async throws {
-        let transport = FakeTransport(stubs: [
-            .init(Data(), 401),
-            .init(Data(), 401),
-        ])
-        let provider = FakeTokenProvider(token: "stale", refreshedToken: "still-bad")
+    // A 401 on a non-expired token throws unauthorized WITHOUT retry/refresh (single request).
+    @Test func unauthorizedOnSingle401WithNoRetry() async throws {
+        let transport = FakeTransport(stubs: [.init(Data(), 401)])
+        let provider = FakeTokenProvider(token: "valid")
         let client = UsageClient(tokenProvider: provider, transport: transport)
 
-        await #expect(throws: UsageError.unauthorized) {
-            try await client.fetchUsage()
-        }
-        #expect(provider.refreshCalls == 1)  // refreshed exactly once, no infinite loop
+        await #expect(throws: UsageError.unauthorized) { try await client.fetchUsage() }
+        #expect(transport.requests.count == 1)  // no second attempt
+        #expect(provider.calls == 1)            // token read once, never re-fetched/refreshed
     }
 
     @Test func throwsHttpErrorOnServerFailure() async throws {
