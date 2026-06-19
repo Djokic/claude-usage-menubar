@@ -91,6 +91,7 @@ public actor CredentialStore: TokenProvider {
     /// Resolved write-access capability for this session (nil until first resolved/probed).
     private var canWrite: Bool?
     private var inFlightRefresh: Task<ClaudeCredentials, Error>?
+    private var probeTask: Task<Void, Never>?
 
     public init(
         runner: CommandRunner = ProcessCommandRunner(),
@@ -121,7 +122,9 @@ public actor CredentialStore: TokenProvider {
         }
         do {
             let refreshed = try await refresh()
-            return TokenSnapshot(accessToken: refreshed.accessToken, isExpired: isExpired(refreshed, now: now()))
+            // Trust a just-minted token (don't re-check expiry — avoids a refresh loop if the
+            // server's expires_in is small or clocks skew within the 5-minute buffer).
+            return TokenSnapshot(accessToken: refreshed.accessToken, isExpired: false)
         } catch {
             // Refresh failed — fall back to the current token, marked expired so the caller shows
             // stale and does NOT query the API. Never hard-error.
@@ -132,13 +135,28 @@ public actor CredentialStore: TokenProvider {
     // MARK: Write-access probe
 
     /// Probe (once) whether this machine grants Keychain write access, surfacing the macOS modify
-    /// prompt on first launch. The result is persisted so the prompt never reappears.
+    /// prompt on first launch. The result is persisted so the prompt never reappears. Single-flight
+    /// so concurrent callers can't trigger two prompts.
     public func ensureWriteAccessProbed() async {
         if let granted = writeAccessStore.granted {
             canWrite = granted
             return
         }
-        let granted = await probeWriteAccess()
+        if let probeTask {
+            await probeTask.value
+            return
+        }
+        let task = Task { () async -> Void in
+            defer { self.probeTask = nil }
+            self.setWriteGranted(await self.probeWriteAccess())
+        }
+        probeTask = task
+        await task.value
+    }
+
+    /// Set the write-access capability in lockstep across the in-actor cache and the persisted flag
+    /// so the two can never diverge.
+    private func setWriteGranted(_ granted: Bool) {
         canWrite = granted
         writeAccessStore.granted = granted
     }
@@ -233,6 +251,11 @@ public actor CredentialStore: TokenProvider {
     /// exactly once.
     @discardableResult
     public func refresh() async throws -> ClaudeCredentials {
+        // Never consume the single-use rotating token unless write-back is granted. Defense in
+        // depth — performRefresh also proves the write actually works before the POST.
+        guard writeGranted() else {
+            throw CredentialError.refreshFailed(status: 0, message: "Keychain write access not granted")
+        }
         if let existing = inFlightRefresh {
             return try await existing.value
         }
@@ -253,6 +276,17 @@ public actor CredentialStore: TokenProvider {
     /// stop consuming the rotating token on a machine that can't save it.
     private func performRefresh() async throws -> ClaudeCredentials {
         let current = try await load()
+
+        // Prove we can write the Keychain THIS session BEFORE consuming the single-use token: a
+        // no-op re-save of the current credentials. If it fails — e.g. a stale "granted" flag from
+        // a machine whose ACL has since changed — downgrade to read-only and abort WITHOUT POSTing,
+        // so the rotating token is never consumed on a machine that can't save the replacement.
+        do {
+            try await persist(current)
+        } catch {
+            setWriteGranted(false)
+            throw error
+        }
 
         var request = URLRequest(url: Self.refreshURL)
         request.httpMethod = "POST"
@@ -286,13 +320,14 @@ public actor CredentialStore: TokenProvider {
             refreshToken: parsed.refreshToken,
             expiresAt: Int(now().timeIntervalSince1970 * 1000) + parsed.expiresIn * 1000
         )
+        // Write-back should succeed (we proved it above); if it somehow fails now, keep the
+        // refreshed token for this call and stop refreshing. Log the failure only — never the
+        // credentials themselves.
         do {
             try await persist(newCredentials)
         } catch {
-            // Non-fatal. Log the failure only — never the credentials themselves.
-            canWrite = false
-            writeAccessStore.granted = false
-            fputs("[ClaudeUsage] Keychain write-back failed; using the refreshed token in memory and disabling refresh: \(error)\n", stderr)
+            setWriteGranted(false)
+            fputs("[ClaudeUsage] Keychain write-back failed after refresh; disabling refresh: \(error)\n", stderr)
         }
         return newCredentials
     }
@@ -301,7 +336,7 @@ public actor CredentialStore: TokenProvider {
 
     /// Write credentials to the Keychain via the `security` CLI. The secret JSON is fed over
     /// **stdin** (trailing `-w` with no inline value), so tokens never appear in the argument list.
-    func persist(_ credentials: ClaudeCredentials) async throws {
+    private func persist(_ credentials: ClaudeCredentials) async throws {
         let envelope = CredentialsEnvelope(claudeAiOauth: credentials)
         let data = try JSONEncoder().encode(envelope)
         let json = String(data: data, encoding: .utf8) ?? "{}"
@@ -324,7 +359,7 @@ public actor CredentialStore: TokenProvider {
 }
 
 /// OAuth token-refresh response.
-struct RefreshResponse: Decodable {
+private struct RefreshResponse: Decodable {
     let accessToken: String
     let refreshToken: String
     let expiresIn: Int

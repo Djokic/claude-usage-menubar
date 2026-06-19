@@ -1,8 +1,9 @@
 import Foundation
 
 public enum UsageError: Error, Equatable {
-    /// The stored access token is expired; we deliberately don't refresh (read-only), so there's
-    /// nothing valid to send. Resolves on its own once Claude Code refreshes its token.
+    /// The stored access token is expired and no refreshed token is available (read-only machine,
+    /// or a refresh attempt failed), so there's nothing valid to send. Resolves on its own once
+    /// Claude Code refreshes its token.
     case tokenExpired
     /// The server rejected the (non-expired) token with a 401. Not retried — refreshing would
     /// consume Claude Code's single-use rotating refresh token.
@@ -16,10 +17,11 @@ public protocol UsageFetching: Sendable {
     func fetchUsage() async throws -> ClaudeUsage
 }
 
-/// Queries `GET https://api.anthropic.com/api/oauth/usage` with the OAuth headers the Claude
-/// Code CLI uses. Read-only: it sends only a non-expired stored token and never refreshes — a
-/// 401 or an expired token is surfaced as an error for the caller to show as stale, never turned
-/// into a token refresh (which would consume Claude Code's rotating refresh token).
+/// Queries `GET https://api.anthropic.com/api/oauth/usage` with the OAuth headers the Claude Code
+/// CLI uses. It sends only a non-expired token: the `TokenProvider` may have refreshed it (on
+/// machines where that's safe) or returned it expired (read-only machines). An expired token is
+/// surfaced as `.tokenExpired` without any request; a 401 is surfaced without retry — the client
+/// itself never triggers a refresh.
 public final class UsageClient: UsageFetching, @unchecked Sendable {
     public static let endpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 

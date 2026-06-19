@@ -92,8 +92,8 @@ public final class AppState: ObservableObject {
             await Task.detached(priority: .utility) { store.save(result, at: stamp) }.value
         } catch {
             if Self.isStale(error) {
-                // Token expired / not signed in: not a hard error. Keep showing last-known usage
-                // and wait for Claude Code to refresh its own token — we never refresh it for them.
+                // Token expired (and no usable refresh) / not signed in: not a hard error. Keep
+                // showing last-known usage; it recovers once a fresh token is available.
                 errorMessage = staleMessage()
                 phase = .stale
             } else {
