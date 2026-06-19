@@ -139,7 +139,7 @@ public actor CredentialStore: TokenProvider {
     /// so concurrent callers can't trigger two prompts.
     public func ensureWriteAccessProbed() async {
         if let granted = writeAccessStore.granted {
-            canWrite = granted
+            setWriteGranted(granted)
             return
         }
         if let probeTask {
@@ -275,14 +275,18 @@ public actor CredentialStore: TokenProvider {
     /// token is returned for in-session use and refresh is disabled (downgraded to read-only) so we
     /// stop consuming the rotating token on a machine that can't save it.
     private func performRefresh() async throws -> ClaudeCredentials {
-        let current = try await load()
+        // Read the RAW Keychain blob (not load()'s decoded 3-field form, and not the file fallback):
+        // we refresh the live Keychain item in place and must preserve every field Claude Code
+        // stored (scopes, subscriptionType, …).
+        let raw = (try await readRawKeychain()).trimmingCharacters(in: .whitespacesAndNewlines)
+        let current = try decodeEnvelope(raw)
 
-        // Prove we can write the Keychain THIS session BEFORE consuming the single-use token: a
-        // no-op re-save of the current credentials. If it fails — e.g. a stale "granted" flag from
-        // a machine whose ACL has since changed — downgrade to read-only and abort WITHOUT POSTing,
-        // so the rotating token is never consumed on a machine that can't save the replacement.
+        // Prove we can write the Keychain THIS session BEFORE consuming the single-use token: write
+        // the exact stored bytes back (a true no-op). If it fails — e.g. a stale "granted" flag on a
+        // machine whose ACL has since changed — downgrade to read-only and abort WITHOUT POSTing, so
+        // the rotating token is never consumed on a machine that can't save the replacement.
         do {
-            try await persist(current)
+            try await persistRaw(raw)
         } catch {
             setWriteGranted(false)
             throw error
@@ -315,33 +319,51 @@ public actor CredentialStore: TokenProvider {
             throw CredentialError.decodingFailed("\(error)")
         }
 
-        let newCredentials = ClaudeCredentials(
+        let newExpiresAt = Int(now().timeIntervalSince1970 * 1000) + parsed.expiresIn * 1000
+        // Update only the three rotating fields in place, preserving every other key Claude Code
+        // stored, so the rotated write-back is a faithful update rather than a degraded rewrite.
+        let updated = try mergeCredentialFields(
+            into: raw,
             accessToken: parsed.accessToken,
             refreshToken: parsed.refreshToken,
-            expiresAt: Int(now().timeIntervalSince1970 * 1000) + parsed.expiresIn * 1000
+            expiresAt: newExpiresAt
         )
         // Write-back should succeed (we proved it above); if it somehow fails now, keep the
         // refreshed token for this call and stop refreshing. Log the failure only — never the
         // credentials themselves.
         do {
-            try await persist(newCredentials)
+            try await persistRaw(updated)
         } catch {
             setWriteGranted(false)
             fputs("[ClaudeUsage] Keychain write-back failed after refresh; disabling refresh: \(error)\n", stderr)
         }
-        return newCredentials
+        return ClaudeCredentials(
+            accessToken: parsed.accessToken,
+            refreshToken: parsed.refreshToken,
+            expiresAt: newExpiresAt
+        )
+    }
+
+    /// Update only `accessToken`/`refreshToken`/`expiresAt` under `claudeAiOauth`, preserving every
+    /// other key Claude Code stored. Round-tripping through the 3-field `ClaudeCredentials` model
+    /// would silently drop fields like `scopes`/`subscriptionType` and corrupt the shared item.
+    private nonisolated func mergeCredentialFields(
+        into raw: String, accessToken: String, refreshToken: String, expiresAt: Int
+    ) throws -> String {
+        guard let data = raw.data(using: .utf8),
+              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              var oauth = root["claudeAiOauth"] as? [String: Any] else {
+            throw CredentialError.decodingFailed("unexpected credentials shape for write-back")
+        }
+        oauth["accessToken"] = accessToken
+        oauth["refreshToken"] = refreshToken
+        oauth["expiresAt"] = expiresAt
+        root["claudeAiOauth"] = oauth
+        let out = try JSONSerialization.data(withJSONObject: root)
+        return String(data: out, encoding: .utf8) ?? ""
     }
 
     // MARK: Writing
-
-    /// Write credentials to the Keychain via the `security` CLI. The secret JSON is fed over
-    /// **stdin** (trailing `-w` with no inline value), so tokens never appear in the argument list.
-    private func persist(_ credentials: ClaudeCredentials) async throws {
-        let envelope = CredentialsEnvelope(claudeAiOauth: credentials)
-        let data = try JSONEncoder().encode(envelope)
-        let json = String(data: data, encoding: .utf8) ?? "{}"
-        try await persistRaw(json)
-    }
 
     /// Write a raw secret string to the Keychain item. `add-generic-password -w` with no inline
     /// value prompts for the password and a "retype" confirmation, both read from stdin — so the
