@@ -179,7 +179,7 @@ import Foundation
         #expect(!runner.didWriteKeychain)  // no probe write performed
     }
 
-    @Test func probeWritesExactBytesReadBackVerbatim() async {
+    @Test func probeWritesExactBytesReadBackVerbatim() async throws {
         let raw = blob(access: "verbatim-acc", refresh: "verbatim-ref", expiresAt: 999)
         let runner = FakeCommandRunner { _, args in
             args.first == "find-generic-password" ? raw + "\n" : ""  // -w appends a display newline
@@ -188,10 +188,13 @@ import Foundation
         let cred = CredentialStore(runner: runner, transport: FakeTransport(), writeAccessStore: store)
 
         await cred.ensureWriteAccessProbed()
-        let stdin = try! #require(runner.lastWriteStdin)
-        // The exact stored value (trimmed of the display newline) is fed back, no re-encoding.
-        #expect(stdin.contains(raw))
-        #expect(stdin.split(separator: "\n").first.map(String.init) == raw)
+        let stdin = try #require(runner.lastWriteStdin)
+        // The exact stored value (trimmed of the display newline) is fed back verbatim, no
+        // re-encoding — and BOTH stdin copies (password + retype) must equal it.
+        let lines = stdin.components(separatedBy: "\n")
+        #expect(lines.count >= 2)
+        #expect(lines[0] == raw)
+        #expect(lines[1] == raw)
     }
 
     // MARK: Refresh
@@ -252,12 +255,14 @@ import Foundation
         #expect(results.allSatisfy { $0.accessToken == "coalesced" })
     }
 
-    // Persist failure after a successful POST is non-fatal AND downgrades the grant to read-only.
-    @Test func persistFailureIsNonFatalAndDowngradesGrant() async throws {
+    // Safety: a Keychain write failure aborts refresh BEFORE the POST — the single-use token is
+    // never consumed (no logout) — and downgrades the grant to read-only. Models a stale
+    // `granted=true` whose machine ACL has since changed.
+    @Test func writeFailureAbortsRefreshBeforeConsumingToken() async throws {
         let fixedNow = Date(timeIntervalSince1970: 1_000_000)
         let runner = FakeCommandRunner { _, args in
             if args.first == "find-generic-password" { return self.blob(refresh: "old", expiresAt: self.pastExpiry(fixedNow)) }
-            throw CredentialError.commandFailed(status: 1, message: "denied")  // write-back denied
+            throw CredentialError.commandFailed(status: 1, message: "denied")  // any Keychain write fails
         }
         let json1 = #"{"access_token":"a1","refresh_token":"r1","expires_in":3600}"#.data(using: .utf8)!
         let store = WriteAccessStore(defaults: UserDefaults(suiteName: "downgrade-\(UUID().uuidString)")!, key: "g")
@@ -265,13 +270,27 @@ import Foundation
         let transport = FakeTransport(stubs: [.init(json1, 200)])
         let cred = CredentialStore(runner: runner, transport: transport, now: { fixedNow }, writeAccessStore: store)
 
-        let creds = try await cred.refresh()   // must NOT throw despite persist failure
-        #expect(creds.accessToken == "a1")
-        #expect(store.granted == false)         // downgraded so we stop consuming the token
+        await #expect(throws: CredentialError.self) { try await cred.refresh() }
+        #expect(transport.requests.isEmpty)   // token NEVER consumed — no POST happened
+        #expect(store.granted == false)         // downgraded to read-only
 
-        // A subsequent expired currentToken now behaves read-only: no further POST.
+        // A subsequent expired currentToken is read-only now: still no POST.
         let snap = try await cred.currentToken()
         #expect(snap.isExpired == true)
-        #expect(transport.requests.count == 1)  // no second refresh attempt
+        #expect(transport.requests.isEmpty)
+    }
+
+    // Safety default: until the probe has run (granted == nil), an expired token is read-only —
+    // no refresh POST, no Keychain write. "Read-only until proven writable."
+    @Test func unprobedGrantDefaultsToReadOnly() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, _ in self.blob(access: "stale", expiresAt: self.pastExpiry(fixedNow)) }
+        let transport = FakeTransport()
+        let cred = CredentialStore(runner: runner, transport: transport, now: { fixedNow }, writeAccessStore: writeStore())  // granted == nil
+
+        let snap = try await cred.currentToken()
+        #expect(snap.isExpired == true)
+        #expect(transport.requests.isEmpty)
+        #expect(!runner.didWriteKeychain)
     }
 }
