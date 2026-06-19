@@ -79,12 +79,17 @@ public final class AppState: ObservableObject {
         phase = .loading
         do {
             let result = try await client.fetchUsage()
+            // A superseded (cancelled) refresh must not overwrite newer state or persist stale data.
+            if Task.isCancelled { return }
             let stamp = now()
             usage = result
             lastUpdated = stamp
             errorMessage = nil
             phase = .loaded
-            lastUsageStore.save(result, at: stamp)
+            // Persist off the main actor so the per-tick file write never stalls the UI; awaited
+            // so the on-disk cache is consistent by the time refresh() returns.
+            let store = lastUsageStore
+            await Task.detached(priority: .utility) { store.save(result, at: stamp) }.value
         } catch {
             if Self.isStale(error) {
                 // Token expired / not signed in: not a hard error. Keep showing last-known usage

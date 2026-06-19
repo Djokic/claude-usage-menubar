@@ -3,16 +3,16 @@ import Foundation
 
 /// Records calls and returns canned output (or throws) for the `security` CLI seam.
 final class FakeCommandRunner: CommandRunner, @unchecked Sendable {
-    var handler: (String, [String], String?) throws -> String
-    private(set) var calls: [(executable: String, arguments: [String], stdin: String?)] = []
+    var handler: (String, [String]) throws -> String
+    private(set) var calls: [(executable: String, arguments: [String])] = []
 
-    init(handler: @escaping (String, [String], String?) throws -> String = { _, _, _ in "" }) {
+    init(handler: @escaping (String, [String]) throws -> String = { _, _ in "" }) {
         self.handler = handler
     }
 
-    func run(_ executable: String, _ arguments: [String], stdin: String?) throws -> String {
-        calls.append((executable, arguments, stdin))
-        return try handler(executable, arguments, stdin)
+    func run(_ executable: String, _ arguments: [String]) throws -> String {
+        calls.append((executable, arguments))
+        return try handler(executable, arguments)
     }
 }
 

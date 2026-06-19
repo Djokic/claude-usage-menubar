@@ -42,6 +42,7 @@ struct TooltipView: View {
             }
         }
         .buttonStyle(.borderless)
+        .accessibilityLabel("Refresh")
         .help("Refresh now")
         .disabled(state.phase == .loading)
     }

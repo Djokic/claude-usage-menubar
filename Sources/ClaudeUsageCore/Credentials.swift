@@ -1,15 +1,18 @@
 import Foundation
 
 /// The OAuth credentials Claude Code stores in the Keychain.
+///
+/// We deliberately decode only the access token and expiry — never the refresh token. Not holding
+/// it in memory is defense-in-depth for the read-only contract: we cannot consume (and thus cannot
+/// log Claude Code out via) a token we never read. The Keychain JSON's `refreshToken` key is simply
+/// ignored by the decoder.
 public struct ClaudeCredentials: Codable, Equatable, Sendable {
     public var accessToken: String
-    public var refreshToken: String
     /// Expiry as epoch milliseconds (matches Claude Code's stored format).
     public var expiresAt: Int
 
-    public init(accessToken: String, refreshToken: String, expiresAt: Int) {
+    public init(accessToken: String, expiresAt: Int) {
         self.accessToken = accessToken
-        self.refreshToken = refreshToken
         self.expiresAt = expiresAt
     }
 }
@@ -135,13 +138,15 @@ public actor CredentialStore: TokenProvider {
 
     /// Keychain read failed: try the credentials-file fallback, then surface "not signed in".
     private func fallbackCredentials() throws -> ClaudeCredentials {
-        if let creds = try loadFromFallbackFile() { return creds }
+        if let creds = loadFromFallbackFile() { return creds }
         throw CredentialError.notAuthenticated
     }
 
-    private nonisolated func loadFromFallbackFile() throws -> ClaudeCredentials? {
+    /// Best-effort secondary source. A missing OR corrupt file both degrade to `nil` (→ "not
+    /// signed in" → stale), rather than surfacing a hard decoding error from a fallback path.
+    private nonisolated func loadFromFallbackFile() -> ClaudeCredentials? {
         guard let data = try? Data(contentsOf: fallbackFileURL) else { return nil }
-        return try decodeEnvelope(String(data: data, encoding: .utf8) ?? "")
+        return try? decodeEnvelope(String(data: data, encoding: .utf8) ?? "")
     }
 
     nonisolated func decodeEnvelope(_ raw: String) throws -> ClaudeCredentials {

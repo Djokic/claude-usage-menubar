@@ -31,9 +31,12 @@ public struct LastUsageStore: Sendable {
     /// its display data, so all failures are swallowed (no secrets are involved here).
     public func save(_ usage: ClaudeUsage, at date: Date) {
         do {
+            // Owner-only directory so the file isn't exposed during the brief window between the
+            // atomic write (default perms) and the 0600 chmod below.
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
             )
             let data = try JSONEncoder().encode(Snapshot(usage: usage, savedAt: date))
             try data.write(to: fileURL, options: [.atomic])
