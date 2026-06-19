@@ -143,9 +143,15 @@ public actor CredentialStore: TokenProvider {
         }
         // No `await` between the nil-check and this assignment, so reentrancy during the awaits
         // inside the task cannot start a second refresh.
-        let task = Task { try await self.performRefresh() }
+        let task = Task { () async throws -> ClaudeCredentials in
+            // Clear the slot when the refresh itself finishes — NOT in the caller's `defer`.
+            // If the calling task is cancelled, its `await task.value` throws but this Task keeps
+            // running; clearing here keeps the slot occupied until the real work completes, so a
+            // concurrent caller joins it instead of starting a second (single-use) token rotation.
+            defer { self.inFlightRefresh = nil }
+            return try await self.performRefresh()
+        }
         inFlightRefresh = task
-        defer { inFlightRefresh = nil }
         return try await task.value
     }
 

@@ -75,7 +75,7 @@ public struct ProcessCommandRunner: CommandRunner {
         var outData = Data()
         var errData = Data()
         let group = DispatchGroup()
-        let drainQueue = DispatchQueue(label: "ClaudeUsage.command-drain", attributes: .concurrent)
+        let drainQueue = DispatchQueue.global()
         group.enter()
         drainQueue.async {
             outData = outPipe.fileHandleForReading.readDataToEndOfFile()
@@ -88,8 +88,14 @@ public struct ProcessCommandRunner: CommandRunner {
         }
 
         if exited.wait(timeout: .now() + timeout) == .timedOut {
-            process.terminate()
-            group.wait()
+            process.terminate()  // SIGTERM
+            // Escalate to SIGKILL if it doesn't exit promptly, then wait only briefly — a
+            // grandchild holding the pipes open must never make run() block forever.
+            if exited.wait(timeout: .now() + 1) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+            }
+            _ = group.wait(timeout: .now() + 1)
+            // Don't read outData/errData here — a bounded wait may have left a drain in flight.
             throw CredentialError.commandTimedOut
         }
         group.wait()  // ensures both reads finished before we touch the buffers
