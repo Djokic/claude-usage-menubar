@@ -87,6 +87,10 @@ public actor CredentialStore: TokenProvider {
         self.fallbackFileURL = fallbackFileURL
     }
 
+    /// Freshest credentials seen this session. Lets a refresh whose Keychain write-back failed
+    /// still serve (and re-use) the rotated token instead of falling back to the stale Keychain.
+    private var cachedCredentials: ClaudeCredentials?
+
     // MARK: Off-actor command execution
 
     /// Run the blocking `security` subprocess off the actor's executor (on a background queue)
@@ -110,16 +114,31 @@ public actor CredentialStore: TokenProvider {
                 "/usr/bin/security",
                 ["find-generic-password", "-s", Self.keychainService, "-w"]
             )
-            return try decodeEnvelope(raw)
+            return cacheFreshest(try decodeEnvelope(raw))
         } catch let error as CredentialError {
-            // Decoding errors are real corruption — don't mask them with the fallback.
+            // Decoding errors are real corruption — don't mask them with the cache/fallback.
             if case .decodingFailed = error { throw error }
+            // Keychain read failed: prefer an in-memory token (e.g. a rotated one we couldn't
+            // persist), then the credentials-file fallback, then surface "not signed in".
+            if let cached = cachedCredentials { return cached }
             if let creds = try loadFromFallbackFile() { return creds }
             throw CredentialError.notAuthenticated
         } catch {
+            if let cached = cachedCredentials { return cached }
             if let creds = try loadFromFallbackFile() { return creds }
             throw CredentialError.notAuthenticated
         }
+    }
+
+    /// Update the cache to the freshest of `credentials` and the current cache (by `expiresAt`)
+    /// and return that. The Keychain wins ties, so external rotations by Claude Code are
+    /// respected; the cache only wins when it is strictly newer (we rotated but couldn't persist).
+    private func cacheFreshest(_ credentials: ClaudeCredentials) -> ClaudeCredentials {
+        if let cached = cachedCredentials, cached.expiresAt > credentials.expiresAt {
+            return cached
+        }
+        cachedCredentials = credentials
+        return credentials
     }
 
     private nonisolated func loadFromFallbackFile() throws -> ClaudeCredentials? {
@@ -209,7 +228,18 @@ public actor CredentialStore: TokenProvider {
             refreshToken: parsed.refreshToken,
             expiresAt: Int(now().timeIntervalSince1970 * 1000) + parsed.expiresIn * 1000
         )
-        try await persist(newCredentials)
+        // Cache first so the rotated token is usable even if the Keychain write-back fails.
+        cachedCredentials = newCredentials
+        do {
+            try await persist(newCredentials)
+        } catch {
+            // Non-fatal: the refresh succeeded and we hold a valid token in memory, so the app
+            // still shows usage. The cache (fresher than the stale Keychain) serves later reads.
+            // Log the failure only — never the credentials themselves.
+            try? FileHandle.standardError.write(
+                contentsOf: Data("[ClaudeUsage] Keychain write-back failed; using refreshed token in memory: \(error)\n".utf8)
+            )
+        }
         return newCredentials
     }
 

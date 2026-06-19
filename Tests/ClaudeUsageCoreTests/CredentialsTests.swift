@@ -258,4 +258,98 @@ import Foundation
         #expect(result.accessToken == "one")
         #expect(transport.requests.count == 1)  // a single rotation despite the cancel
     }
+
+    // Covers R1: a failed Keychain write-back after a successful refresh is non-fatal.
+    @Test func persistFailureIsNonFatalAndReturnsRotatedCreds() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, args, _ in
+            if args.first == "find-generic-password" { return self.blob(refresh: "old", expiresAt: self.pastExpiry(fixedNow)) }
+            throw CredentialError.commandFailed(status: 1, message: "denied")  // persist (add-generic-password) fails
+        }
+        let refreshJSON = #"{"access_token":"new-acc","refresh_token":"rotated","expires_in":3600}"#.data(using: .utf8)!
+        let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow })
+
+        let creds = try await store.refresh()  // must NOT throw despite the persist failure
+        #expect(creds.accessToken == "new-acc")
+        #expect(creds.refreshToken == "rotated")
+    }
+
+    // Covers R2: after a persist-failed refresh, load() serves the rotated creds from the cache.
+    @Test func loadAfterPersistFailureReturnsRotatedCredsFromCache() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, args, _ in
+            if args.first == "find-generic-password" { return self.blob(access: "stale", refresh: "old", expiresAt: self.pastExpiry(fixedNow)) }
+            throw CredentialError.commandFailed(status: 1, message: "denied")
+        }
+        let refreshJSON = #"{"access_token":"new-acc","refresh_token":"rotated","expires_in":3600}"#.data(using: .utf8)!
+        let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow })
+
+        _ = try await store.refresh()
+        let loaded = try await store.load()   // keychain still stale; cache (newer) wins
+        #expect(loaded.accessToken == "new-acc")
+    }
+
+    // Covers R2: an external rotation (newer Keychain) wins over a stale cache.
+    @Test func loadPrefersKeychainWhenNewerThanCache() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let nowMs = Int(fixedNow.timeIntervalSince1970 * 1000)
+        let runner = FakeCommandRunner()
+        runner.handler = { _, _, _ in self.blob(access: "A", expiresAt: nowMs + 1000) }
+        let store = CredentialStore(runner: runner, transport: FakeTransport(), now: { fixedNow })
+
+        let first = try await store.load()
+        #expect(first.accessToken == "A")          // cache seeded with A
+
+        runner.handler = { _, _, _ in self.blob(access: "B", expiresAt: nowMs + 9999) }  // Claude Code rotated externally
+        let second = try await store.load()
+        #expect(second.accessToken == "B")          // newer Keychain wins over cached A
+    }
+
+    // Covers R2/R4: a transient Keychain read failure falls back to the cache.
+    @Test func loadFallsBackToCacheWhenKeychainReadFails() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let nowMs = Int(fixedNow.timeIntervalSince1970 * 1000)
+        let runner = FakeCommandRunner()
+        runner.handler = { _, _, _ in self.blob(access: "cached-A", expiresAt: nowMs + 9999) }
+        let store = CredentialStore(runner: runner, transport: FakeTransport(), now: { fixedNow })
+        _ = try await store.load()   // seed cache
+
+        runner.handler = { _, _, _ in throw CredentialError.commandFailed(status: 1, message: "denied") }
+        let loaded = try await store.load()
+        #expect(loaded.accessToken == "cached-A")
+    }
+
+    // Covers R2: a later refresh uses the cached rotated token, not the stale Keychain one.
+    @Test func secondRefreshUsesCachedRotatedToken() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let runner = FakeCommandRunner { _, args, _ in
+            if args.first == "find-generic-password" { return self.blob(refresh: "stale-keychain", expiresAt: self.pastExpiry(fixedNow)) }
+            throw CredentialError.commandFailed(status: 1, message: "denied")  // persist always denied
+        }
+        let json1 = #"{"access_token":"a1","refresh_token":"rotated-1","expires_in":3600}"#.data(using: .utf8)!
+        let json2 = #"{"access_token":"a2","refresh_token":"rotated-2","expires_in":3600}"#.data(using: .utf8)!
+        let transport = FakeTransport(stubs: [.init(json1, 200), .init(json2, 200)])
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow })
+
+        _ = try await store.refresh()   // rotates to rotated-1; persist fails; cached
+        _ = try await store.refresh()   // uses cached rotated-1, not stale-keychain
+
+        let secondBody = try #require(transport.requests.last?.httpBody)
+        let json = try #require(JSONSerialization.jsonObject(with: secondBody) as? [String: String])
+        #expect(json["refresh_token"] == "rotated-1")
+    }
+
+    // Covers R4: corrupt Keychain JSON still surfaces decodingFailed (not masked by cache/fallback).
+    @Test func decodingFailedFromKeychainStillThrowsAndIsNotMasked() async throws {
+        let runner = FakeCommandRunner { _, _, _ in "not json at all" }
+        let store = CredentialStore(runner: runner, transport: FakeTransport(), fallbackFileURL: nonexistentFallback())
+        var thrown: CredentialError?
+        do { _ = try await store.load() } catch let error as CredentialError { thrown = error }
+        guard case .decodingFailed = thrown else {
+            Issue.record("expected decodingFailed, got \(String(describing: thrown))")
+            return
+        }
+    }
 }
