@@ -62,6 +62,9 @@ struct TooltipView: View {
                 if let sonnet = usage.sevenDaySonnet {
                     LimitRow(title: "Weekly · Sonnet", window: sonnet, muted: true)
                 }
+                ForEach(usage.modelWeeklyLimits, id: \.self) { limit in
+                    LimitRow(title: "Weekly · \(limit.modelName ?? "Model")", window: limit.window, muted: true)
+                }
 
                 if state.phase == .error {
                     Label("Couldn't refresh — showing last data", systemImage: "exclamationmark.triangle")

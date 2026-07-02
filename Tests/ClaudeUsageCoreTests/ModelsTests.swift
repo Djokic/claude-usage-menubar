@@ -133,4 +133,79 @@ import Foundation
         let usage = try ClaudeUsage.decode(from: json)
         #expect(usage.fiveHour?.utilization == 1)
     }
+
+    // MARK: `limits` array (per-model weekly limits, e.g. Fable)
+
+    /// The exact shape observed live 2026-07-02: legacy `seven_day_*` keys null, Fable only
+    /// present as a `weekly_scoped` entry in `limits`.
+    @Test func decodesModelScopedLimitFromLimitsArray() throws {
+        let json = """
+        {
+          "five_hour": { "utilization": 47.0, "resets_at": "2026-07-02T12:09:59.228640+00:00" },
+          "seven_day": { "utilization": 12.0, "resets_at": "2026-07-07T11:00:00.228663+00:00" },
+          "seven_day_opus": null,
+          "seven_day_sonnet": null,
+          "limits": [
+            { "kind": "session", "group": "session", "percent": 47, "severity": "normal",
+              "resets_at": "2026-07-02T12:09:59.228640+00:00", "scope": null, "is_active": true },
+            { "kind": "weekly_all", "group": "weekly", "percent": 12, "severity": "normal",
+              "resets_at": "2026-07-07T11:00:00.228663+00:00", "scope": null, "is_active": false },
+            { "kind": "weekly_scoped", "group": "weekly", "percent": 19, "severity": "normal",
+              "resets_at": "2026-07-07T10:59:59.228928+00:00",
+              "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null },
+              "is_active": false }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let usage = try ClaudeUsage.decode(from: json)
+        let fable = try #require(usage.modelWeeklyLimits.first)
+        #expect(usage.modelWeeklyLimits.count == 1)  // session + weekly_all excluded
+        #expect(fable.modelName == "Fable")
+        #expect(fable.percent == 19)
+        #expect(fable.window?.utilization == 19)
+        #expect(fable.resetsAt == ISO8601.parse("2026-07-07T10:59:59.228928+00:00"))
+    }
+
+    /// Persisted snapshots must round-trip: encode → decode preserves the scoped limit.
+    @Test func limitsRoundTripThroughEncoding() throws {
+        let usage = ClaudeUsage(
+            fiveHour: UsageWindow(utilization: 47, resetsAt: Date(timeIntervalSince1970: 2_000_000)),
+            sevenDay: nil,
+            limits: [
+                UsageLimit(kind: "weekly_scoped", percent: 19,
+                           resetsAt: Date(timeIntervalSince1970: 2_500_000), modelName: "Fable"),
+                UsageLimit(kind: "weekly_all", percent: 12, resetsAt: nil, modelName: nil),
+            ]
+        )
+        let decoded = try ClaudeUsage.decode(from: JSONEncoder().encode(usage))
+        #expect(decoded == usage)
+        #expect(decoded.modelWeeklyLimits.first?.modelName == "Fable")
+    }
+
+    /// Old persisted snapshots have no `limits` key at all — must still decode.
+    @Test func missingLimitsKeyDecodesToNil() throws {
+        let json = """
+        { "five_hour": { "utilization": 1, "resets_at": "2026-06-16T18:45:00Z" }, "seven_day": null }
+        """.data(using: .utf8)!
+        let usage = try ClaudeUsage.decode(from: json)
+        #expect(usage.limits == nil)
+        #expect(usage.modelWeeklyLimits.isEmpty)
+    }
+
+    /// If the API ever populates BOTH the legacy `seven_day_opus` key and a scoped "Opus" limit,
+    /// the model must not show twice; unrelated models (Fable) still surface.
+    @Test func modelWeeklyLimitsExcludesModelsAlreadyInLegacyFields() throws {
+        let reset = Date(timeIntervalSince1970: 2_500_000)
+        let usage = ClaudeUsage(
+            fiveHour: nil,
+            sevenDay: nil,
+            sevenDayOpus: UsageWindow(utilization: 5, resetsAt: reset),
+            limits: [
+                UsageLimit(kind: "weekly_scoped", percent: 5, resetsAt: reset, modelName: "Opus"),
+                UsageLimit(kind: "weekly_scoped", percent: 19, resetsAt: reset, modelName: "Fable"),
+            ]
+        )
+        #expect(usage.modelWeeklyLimits.map(\.modelName) == ["Fable"])
+    }
 }

@@ -95,6 +95,65 @@ public struct ExtraUsage: Codable, Equatable, Sendable {
     }
 }
 
+/// One entry of the API's newer `limits` array — the shape that carries per-model weekly limits
+/// (e.g. Fable) now that the legacy `seven_day_<model>` keys return `null`. Only the fields the
+/// app renders are decoded; unknown kinds are kept but simply not displayed.
+public struct UsageLimit: Codable, Equatable, Hashable, Sendable {
+    /// e.g. `session`, `weekly_all`, `weekly_scoped`.
+    public let kind: String
+    /// Usage percentage, 0–100.
+    public let percent: Double
+    public let resetsAt: Date?
+    /// Model display name when the limit is scoped to one model (from `scope.model.display_name`).
+    public let modelName: String?
+
+    public init(kind: String, percent: Double, resetsAt: Date?, modelName: String?) {
+        self.kind = kind
+        self.percent = percent
+        self.resetsAt = resetsAt
+        self.modelName = modelName
+    }
+
+    /// The limit as a displayable window, when it has a reset time.
+    public var window: UsageWindow? {
+        resetsAt.map { UsageWindow(utilization: percent, resetsAt: $0) }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, percent, scope
+        case resetsAt = "resets_at"
+    }
+    private enum ScopeKeys: String, CodingKey { case model }
+    private enum ModelKeys: String, CodingKey { case displayName = "display_name" }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(String.self, forKey: .kind)
+        percent = try container.decode(Double.self, forKey: .percent)
+        resetsAt = (try container.decodeIfPresent(String.self, forKey: .resetsAt)).flatMap(ISO8601.parse)
+        // `scope`, `scope.model`, and `display_name` are all nullable.
+        if let scope = try? container.nestedContainer(keyedBy: ScopeKeys.self, forKey: .scope),
+           let model = try? scope.nestedContainer(keyedBy: ModelKeys.self, forKey: .model) {
+            modelName = try model.decodeIfPresent(String.self, forKey: .displayName)
+        } else {
+            modelName = nil
+        }
+    }
+
+    /// Encode the same nested shape the decoder reads, so persisted snapshots round-trip.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(percent, forKey: .percent)
+        try container.encodeIfPresent(resetsAt.map(ISO8601.string(from:)), forKey: .resetsAt)
+        if let modelName {
+            var scope = container.nestedContainer(keyedBy: ScopeKeys.self, forKey: .scope)
+            var model = scope.nestedContainer(keyedBy: ModelKeys.self, forKey: .model)
+            try model.encode(modelName, forKey: .displayName)
+        }
+    }
+}
+
 /// Decoded response from `GET https://api.anthropic.com/api/oauth/usage`.
 ///
 /// Each window is optional — the API returns `null` for windows that are not
@@ -108,6 +167,8 @@ public struct ClaudeUsage: Codable, Equatable, Sendable {
     public let sevenDayOpus: UsageWindow?
     public let sevenDaySonnet: UsageWindow?
     public let extraUsage: ExtraUsage?
+    /// The newer general limits array; per-model weekly limits (e.g. Fable) only appear here.
+    public let limits: [UsageLimit]?
 
     enum CodingKeys: String, CodingKey {
         case fiveHour = "five_hour"
@@ -116,6 +177,7 @@ public struct ClaudeUsage: Codable, Equatable, Sendable {
         case sevenDayOpus = "seven_day_opus"
         case sevenDaySonnet = "seven_day_sonnet"
         case extraUsage = "extra_usage"
+        case limits
     }
 
     public init(
@@ -124,7 +186,8 @@ public struct ClaudeUsage: Codable, Equatable, Sendable {
         sevenDayOauthApps: UsageWindow? = nil,
         sevenDayOpus: UsageWindow? = nil,
         sevenDaySonnet: UsageWindow? = nil,
-        extraUsage: ExtraUsage? = nil
+        extraUsage: ExtraUsage? = nil,
+        limits: [UsageLimit]? = nil
     ) {
         self.fiveHour = fiveHour
         self.sevenDay = sevenDay
@@ -132,6 +195,19 @@ public struct ClaudeUsage: Codable, Equatable, Sendable {
         self.sevenDayOpus = sevenDayOpus
         self.sevenDaySonnet = sevenDaySonnet
         self.extraUsage = extraUsage
+        self.limits = limits
+    }
+
+    /// Weekly limits scoped to a single model (e.g. "Fable"), in API order. Models already
+    /// surfaced through a non-null legacy `seven_day_*` field are excluded so no model shows
+    /// twice if the API ever populates both shapes.
+    public var modelWeeklyLimits: [UsageLimit] {
+        (limits ?? []).filter { limit in
+            guard limit.kind == "weekly_scoped", let name = limit.modelName else { return false }
+            if sevenDayOpus != nil, name.caseInsensitiveCompare("Opus") == .orderedSame { return false }
+            if sevenDaySonnet != nil, name.caseInsensitiveCompare("Sonnet") == .orderedSame { return false }
+            return true
+        }
     }
 
     /// Decode from raw JSON data using the conventions above.

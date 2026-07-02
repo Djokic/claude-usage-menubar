@@ -7,7 +7,12 @@ struct SampleUsageClient: UsageFetching {
     func fetchUsage() async throws -> ClaudeUsage {
         ClaudeUsage(
             fiveHour: UsageWindow(utilization: 19, resetsAt: Date().addingTimeInterval(3 * 3600 + 22 * 60)),
-            sevenDay: UsageWindow(utilization: 63, resetsAt: Date().addingTimeInterval(2 * 86400 + 4 * 3600))
+            sevenDay: UsageWindow(utilization: 63, resetsAt: Date().addingTimeInterval(2 * 86400 + 4 * 3600)),
+            limits: [
+                UsageLimit(kind: "weekly_scoped", percent: 42,
+                           resetsAt: Date().addingTimeInterval(2 * 86400 + 3 * 3600),
+                           modelName: "Fable"),
+            ]
         )
     }
 }
@@ -26,6 +31,10 @@ func fetchOnceAndExit() -> Never {
             }
             if let seven = usage.sevenDay {
                 print("7d:  \(Int(seven.utilization))% used — \(ResetFormatter.countdown(resetsAt: seven.resetsAt, now: now))")
+            }
+            for limit in usage.modelWeeklyLimits {
+                let reset = limit.resetsAt.map { ResetFormatter.countdown(resetsAt: $0, now: now) } ?? "no reset time"
+                print("7d \(limit.modelName ?? "model"):  \(Int(limit.percent))% used — \(reset)")
             }
             print("OK: live fetch + decode + format succeeded")
         } catch {
