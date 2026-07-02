@@ -115,9 +115,7 @@ import Foundation
     // Write granted: an expired token triggers a refresh and a fresh (non-expired) token.
     @Test func currentTokenExpiredWriteGrantedRefreshes() async throws {
         let fixedNow = Date(timeIntervalSince1970: 1_000_000)
-        let runner = FakeCommandRunner { _, args in
-            args.first == "find-generic-password" ? self.blob(access: "stale", refresh: "old", expiresAt: self.pastExpiry(fixedNow)) : ""
-        }
+        let runner = FakeSecurityCLI(secret: blob(access: "stale", refresh: "old", expiresAt: pastExpiry(fixedNow)))
         let refreshJSON = #"{"access_token":"fresh","refresh_token":"rotated","expires_in":3600}"#.data(using: .utf8)!
         let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])
         let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow }, writeAccessStore: writeStore(granted: true))
@@ -126,15 +124,13 @@ import Foundation
         #expect(snap.accessToken == "fresh")
         #expect(snap.isExpired == false)
         #expect(transport.requests.count == 1)
-        #expect(runner.didWriteKeychain)  // rotated token written back
+        #expect(runner.secret(account: "stefan")?.contains("fresh") == true)  // rotated token written back
     }
 
     // Write granted but the refresh POST fails: fall back to the current token as stale (no throw).
     @Test func currentTokenRefreshFailureFallsBackToStale() async throws {
         let fixedNow = Date(timeIntervalSince1970: 1_000_000)
-        let runner = FakeCommandRunner { _, args in
-            args.first == "find-generic-password" ? self.blob(access: "stale", refresh: "old", expiresAt: self.pastExpiry(fixedNow)) : ""
-        }
+        let runner = FakeSecurityCLI(secret: blob(access: "stale", refresh: "old", expiresAt: pastExpiry(fixedNow)))
         let transport = FakeTransport(stubs: [.init(Data(), 500)])  // refresh POST fails
         let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow }, writeAccessStore: writeStore(granted: true))
 
@@ -146,9 +142,7 @@ import Foundation
     // MARK: Write-access probe
 
     @Test func ensureWriteAccessProbedGrantsOnSuccessfulWrite() async {
-        let runner = FakeCommandRunner { _, args in
-            args.first == "find-generic-password" ? self.blob(access: "tok") : ""
-        }
+        let runner = FakeSecurityCLI(secret: blob(access: "tok"))
         let store = WriteAccessStore(defaults: UserDefaults(suiteName: "probe-\(UUID().uuidString)")!, key: "g")
         let cred = CredentialStore(runner: runner, transport: FakeTransport(), writeAccessStore: store)
 
@@ -158,10 +152,8 @@ import Foundation
     }
 
     @Test func ensureWriteAccessProbedDeniesOnWriteFailure() async {
-        let runner = FakeCommandRunner { _, args in
-            if args.first == "find-generic-password" { return self.blob(access: "tok") }
-            throw CredentialError.commandFailed(status: 1, message: "denied")  // write denied
-        }
+        let runner = FakeSecurityCLI(secret: blob(access: "tok"))
+        runner.failWrites = true  // write denied
         let store = WriteAccessStore(defaults: UserDefaults(suiteName: "probe-\(UUID().uuidString)")!, key: "g")
         let cred = CredentialStore(runner: runner, transport: FakeTransport(), writeAccessStore: store)
 
@@ -170,7 +162,7 @@ import Foundation
     }
 
     @Test func ensureWriteAccessProbedSkipsWhenAlreadyDecided() async {
-        let runner = FakeCommandRunner { _, _ in self.blob(access: "tok") }
+        let runner = FakeSecurityCLI(secret: blob(access: "tok"))
         let store = WriteAccessStore(defaults: UserDefaults(suiteName: "probe-\(UUID().uuidString)")!, key: "g")
         store.granted = true  // already decided
         let cred = CredentialStore(runner: runner, transport: FakeTransport(), writeAccessStore: store)
@@ -179,31 +171,42 @@ import Foundation
         #expect(!runner.didWriteKeychain)  // no probe write performed
     }
 
-    @Test func probeWritesExactBytesReadBackVerbatim() async throws {
+    @Test func probeWritesExactBytesToTheItemsOwnAccount() async throws {
         let raw = blob(access: "verbatim-acc", refresh: "verbatim-ref", expiresAt: 999)
-        let runner = FakeCommandRunner { _, args in
-            args.first == "find-generic-password" ? raw + "\n" : ""  // -w appends a display newline
-        }
+        let runner = FakeSecurityCLI(account: "stefan", secret: raw)
         let store = WriteAccessStore(defaults: UserDefaults(suiteName: "probe-\(UUID().uuidString)")!, key: "g")
         let cred = CredentialStore(runner: runner, transport: FakeTransport(), writeAccessStore: store)
 
         await cred.ensureWriteAccessProbed()
-        let stdin = try #require(runner.lastWriteStdin)
-        // The exact stored value (trimmed of the display newline) is fed back verbatim, no
-        // re-encoding — and BOTH stdin copies (password + retype) must equal it.
-        let lines = stdin.components(separatedBy: "\n")
-        #expect(lines.count >= 2)
-        #expect(lines[0] == raw)
-        #expect(lines[1] == raw)
+        #expect(store.granted == true)
+        // The exact stored value round-trips verbatim, no re-encoding...
+        #expect(runner.secret(account: "stefan") == raw)
+        // ...to the account the item already had — NOT an invented one that would create a
+        // second, shadowing item under the same service.
+        #expect(runner.items.count == 1)
+        let write = try #require(runner.writes.last)
+        #expect(write.account == "stefan")
+    }
+
+    // THE regression test for the v1 corruption: a write path that silently stores a 128-byte
+    // prefix (the `security` stdin password prompt's buffer) must be caught by the read-back
+    // verification and treated as write-denied — never granted.
+    @Test func probeDeniesWhenWritesSilentlyTruncate() async {
+        let bigBlob = blob(access: String(repeating: "a", count: 400))  // > 128 bytes
+        let runner = FakeSecurityCLI(secret: bigBlob)
+        runner.truncateWritesTo = 128
+        let store = WriteAccessStore(defaults: UserDefaults(suiteName: "probe-\(UUID().uuidString)")!, key: "g")
+        let cred = CredentialStore(runner: runner, transport: FakeTransport(), writeAccessStore: store)
+
+        await cred.ensureWriteAccessProbed()
+        #expect(store.granted == false)
     }
 
     // MARK: Refresh
 
     @Test func refreshBuildsCorrectPostBodyFromFreshRead() async throws {
         let fixedNow = Date(timeIntervalSince1970: 1_000_000)
-        let runner = FakeCommandRunner { _, args in
-            args.first == "find-generic-password" ? self.blob(refresh: "fresh-refresh", expiresAt: self.pastExpiry(fixedNow)) : ""
-        }
+        let runner = FakeSecurityCLI(secret: blob(refresh: "fresh-refresh", expiresAt: pastExpiry(fixedNow)))
         let refreshJSON = #"{"access_token":"a","refresh_token":"b","expires_in":3600}"#.data(using: .utf8)!
         let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])
         let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow }, writeAccessStore: writeStore(granted: true))
@@ -218,11 +221,9 @@ import Foundation
         #expect(json["client_id"] == "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
     }
 
-    @Test func refreshComputesExpiryAndPersistsViaStdinNotArgv() async throws {
+    @Test func refreshComputesExpiryAndKeepsSecretOffArgvForSmallBlobs() async throws {
         let fixedNow = Date(timeIntervalSince1970: 2_000_000)
-        let runner = FakeCommandRunner { _, args in
-            args.first == "find-generic-password" ? self.blob(refresh: "old", expiresAt: self.pastExpiry(fixedNow)) : ""
-        }
+        let runner = FakeSecurityCLI(secret: blob(refresh: "old", expiresAt: pastExpiry(fixedNow)))
         let refreshJSON = #"{"access_token":"new-acc","refresh_token":"rotated-secret","expires_in":3600}"#.data(using: .utf8)!
         let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])
         let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow }, writeAccessStore: writeStore(granted: true))
@@ -230,9 +231,34 @@ import Foundation
         let creds = try await store.refresh()
         #expect(creds.accessToken == "new-acc")
         #expect(creds.expiresAt == Int(fixedNow.timeIntervalSince1970 * 1000) + 3600 * 1000)
-        let stdin = try #require(runner.lastWriteStdin)
-        #expect(stdin.contains("rotated-secret"))                    // secret travels via stdin
-        #expect(!runner.calls.contains { $0.arguments.contains(where: { $0.contains("rotated-secret") }) })  // never in argv
+        // A small blob travels via `security -i` stdin — never as a process argument.
+        #expect(runner.writes.allSatisfy { !$0.viaArgv })
+        #expect(runner.secret(account: "stefan")?.contains("rotated-secret") == true)
+    }
+
+    // Blobs whose hex form exceeds `security -i`'s line buffer must take the argv path and still
+    // round-trip byte-exact — the stdin paths silently truncate (128 B for the password prompt,
+    // ~4 KB for `-i` lines), which is the bug that corrupted v1's credential copy.
+    @Test func refreshOfMultiKilobyteBlobUsesArgvAndRoundTripsExactly() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 2_000_000)
+        let bigBlob = """
+        {"claudeAiOauth":{"accessToken":"\(String(repeating: "a", count: 3000))","refreshToken":"old","expiresAt":\(pastExpiry(fixedNow))},"mcpOAuth":{"note":"with \\"quotes\\" and é"}}
+        """
+        let runner = FakeSecurityCLI(secret: bigBlob)
+        let refreshJSON = #"{"access_token":"new-acc","refresh_token":"new-ref","expires_in":3600}"#.data(using: .utf8)!
+        let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])
+        let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow }, writeAccessStore: writeStore(granted: true))
+
+        _ = try await store.refresh()
+        // The pre-POST write-proof re-saves the full multi-KB blob: too big for the -i line
+        // buffer, so it must take the argv path (and still round-trip byte-exact — verified
+        // against the fake's stored state by persistVerified itself).
+        let writeProof = try #require(runner.writes.first)
+        #expect(writeProof.viaArgv)
+        #expect(writeProof.value == bigBlob)
+        let stored = try #require(runner.secret(account: "stefan"))
+        #expect(stored.contains("new-acc"))
+        #expect(stored.contains("with \\\"quotes\\\" and é"))  // byte-exact through hex, no quoting damage
     }
 
     // The rotated write-back must preserve every field Claude Code stored (scopes, subscriptionType,
@@ -243,15 +269,13 @@ import Foundation
         let richBlob = """
         {"claudeAiOauth":{"accessToken":"old-acc","refreshToken":"old-ref","expiresAt":\(pastExpiry(fixedNow)),"scopes":["a","b"],"subscriptionType":"max"}}
         """
-        let runner = FakeCommandRunner { _, args in
-            args.first == "find-generic-password" ? richBlob : ""
-        }
+        let runner = FakeSecurityCLI(secret: richBlob)
         let refreshJSON = #"{"access_token":"new-acc","refresh_token":"new-ref","expires_in":3600}"#.data(using: .utf8)!
         let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])
         let store = CredentialStore(runner: runner, transport: transport, now: { fixedNow }, writeAccessStore: writeStore(granted: true))
 
         _ = try await store.refresh()
-        let written = try #require(runner.lastWriteStdin)
+        let written = try #require(runner.secret(account: "stefan"))
         #expect(written.contains("new-acc"))         // rotating fields updated
         #expect(written.contains("new-ref"))
         #expect(written.contains("subscriptionType"))  // preserved
@@ -261,9 +285,7 @@ import Foundation
 
     @Test func concurrentRefreshesCoalesceIntoOnePost() async throws {
         let fixedNow = Date(timeIntervalSince1970: 1_000_000)
-        let runner = FakeCommandRunner { _, args in
-            args.first == "find-generic-password" ? self.blob(refresh: "old", expiresAt: self.pastExpiry(fixedNow)) : ""
-        }
+        let runner = FakeSecurityCLI(secret: blob(refresh: "old", expiresAt: pastExpiry(fixedNow)))
         let refreshJSON = #"{"access_token":"coalesced","refresh_token":"rotated","expires_in":3600}"#.data(using: .utf8)!
         let transport = FakeTransport(stubs: [.init(refreshJSON, 200)])  // only ONE response
         transport.delay = 0.2
@@ -284,10 +306,8 @@ import Foundation
     // `granted=true` whose machine ACL has since changed.
     @Test func writeFailureAbortsRefreshBeforeConsumingToken() async throws {
         let fixedNow = Date(timeIntervalSince1970: 1_000_000)
-        let runner = FakeCommandRunner { _, args in
-            if args.first == "find-generic-password" { return self.blob(refresh: "old", expiresAt: self.pastExpiry(fixedNow)) }
-            throw CredentialError.commandFailed(status: 1, message: "denied")  // any Keychain write fails
-        }
+        let runner = FakeSecurityCLI(secret: blob(refresh: "old", expiresAt: pastExpiry(fixedNow)))
+        runner.failWrites = true  // any Keychain write fails
         let json1 = #"{"access_token":"a1","refresh_token":"r1","expires_in":3600}"#.data(using: .utf8)!
         let store = WriteAccessStore(defaults: UserDefaults(suiteName: "downgrade-\(UUID().uuidString)")!, key: "g")
         store.granted = true
@@ -302,6 +322,64 @@ import Foundation
         let snap = try await cred.currentToken()
         #expect(snap.isExpired == true)
         #expect(transport.requests.isEmpty)
+    }
+
+    // Same abort-before-POST guarantee when writes "succeed" but corrupt the bytes (the v1
+    // truncation): the round-trip proof must catch it and never consume the single-use token.
+    @Test func truncatingWriteAbortsRefreshBeforeConsumingToken() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_000_000)
+        let bigBlob = blob(access: String(repeating: "a", count: 400), refresh: "old", expiresAt: pastExpiry(fixedNow))
+        let runner = FakeSecurityCLI(secret: bigBlob)
+        runner.truncateWritesTo = 128
+        let store = WriteAccessStore(defaults: UserDefaults(suiteName: "downgrade-\(UUID().uuidString)")!, key: "g")
+        store.granted = true
+        let transport = FakeTransport(stubs: [.init(Data(), 200)])
+        let cred = CredentialStore(runner: runner, transport: transport, now: { fixedNow }, writeAccessStore: store)
+
+        await #expect(throws: CredentialError.writeVerificationFailed) { try await cred.refresh() }
+        #expect(transport.requests.isEmpty)  // token NEVER consumed
+        #expect(store.granted == false)        // downgraded to read-only
+    }
+
+    // MARK: Account resolution
+
+    @Test func parseAccountReadsQuotedForm() {
+        let metadata = """
+        keychain: "/Users/x/Library/Keychains/login.keychain-db"
+        class: "genp"
+        attributes:
+            0x00000007 <blob>="Claude Code-credentials"
+            "acct"<blob>="stefan"
+            "svce"<blob>="Claude Code-credentials"
+        """
+        #expect(CredentialStore.parseAccount(fromMetadata: metadata) == "stefan")
+    }
+
+    @Test func parseAccountReadsHexPrefixedForm() {
+        let metadata = #"    "acct"<blob>=0x73746566616E  "stefan""#
+        #expect(CredentialStore.parseAccount(fromMetadata: metadata) == "stefan")
+    }
+
+    @Test func parseAccountRejectsNullAndMissing() {
+        #expect(CredentialStore.parseAccount(fromMetadata: #"    "acct"<blob>=<NULL>"#) == nil)
+        #expect(CredentialStore.parseAccount(fromMetadata: "no account line here") == nil)
+    }
+
+    // MARK: Secret output normalization
+
+    // `find-generic-password -w` hex-prints non-ASCII secrets; failing to decode would make the
+    // probe re-write the hex STRING as the secret and then verify its own corruption.
+    @Test func normalizeDecodesHexPrintedSecrets() {
+        let secret = #"{"claudeAiOauth":{"note":"café"}}"#
+        let hexOutput = Data(secret.utf8).map { String(format: "%02x", $0) }.joined() + "\n"
+        #expect(CredentialStore.normalizeSecretOutput(hexOutput) == secret)
+    }
+
+    @Test func normalizeKeepsRawJsonAndNonHexOutputVerbatim() {
+        let raw = #"{"claudeAiOauth":{"accessToken":"tok"}}"#
+        #expect(CredentialStore.normalizeSecretOutput(raw + "\n") == raw)
+        // All-hex-looking but not UTF-8 when decoded → kept literal.
+        #expect(CredentialStore.normalizeSecretOutput("deadbeef") == "deadbeef")
     }
 
     // Safety default: until the probe has run (granted == nil), an expired token is read-only —

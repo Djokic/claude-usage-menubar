@@ -31,4 +31,14 @@ import Foundation
         s.granted = nil
         #expect(s.granted == nil)
     }
+
+    // The v1 probe could truncate what it wrote, so a v1 grant is untrustworthy: creating the
+    // store must drop the legacy flag (forcing a re-probe under the verified v2 key).
+    @Test func initDropsLegacyV1Grant() {
+        let defaults = UserDefaults(suiteName: "was-legacy-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "ClaudeUsage.keychainWriteGranted")
+        let s = WriteAccessStore(defaults: defaults)
+        #expect(defaults.object(forKey: "ClaudeUsage.keychainWriteGranted") == nil)
+        #expect(s.granted == nil)  // v2 key starts unprobed
+    }
 }

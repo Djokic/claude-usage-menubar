@@ -93,6 +93,13 @@ The app is **adaptive**. On first launch it asks macOS for permission to update 
 Either way it never logs Claude Code out — it only refreshes when it can save the result. If you
 ran an older build that logged you out, re-login once with `claude`; it won't recur.
 
+Every Keychain write is hex-encoded (`security … -X`) and **verified by reading it back**; a
+write that doesn't round-trip byte-exact downgrades the app to read-only instead of persisting.
+(Builds before July 2026 wrote through `security`'s stdin password prompt, which silently
+truncates secrets at 128 bytes — that corrupted the app's copy of the credentials into a shadow
+Keychain item. If you ran one of those builds, remove the stale item once with
+`security delete-generic-password -s "Claude Code-credentials" -a claude-cli`.)
+
 ## How it works
 
 | Piece | What it does |

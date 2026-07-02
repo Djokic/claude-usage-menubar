@@ -9,6 +9,7 @@ import Foundation
         .commandTimedOut,
         .refreshFailed(status: 401, message: "bad token"),
         .decodingFailed("boom"),
+        .writeVerificationFailed,
     ]
 
     // Covers R3: every case has actionable text and never leaks the raw enum description.

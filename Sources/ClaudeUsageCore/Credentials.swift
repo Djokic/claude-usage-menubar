@@ -25,6 +25,8 @@ public enum CredentialError: Error, Equatable, LocalizedError {
     case commandTimedOut
     case refreshFailed(status: Int, message: String)
     case decodingFailed(String)
+    /// A Keychain write reported success but the read-back did not match the bytes written.
+    case writeVerificationFailed
 
     /// Human, actionable text shown in the UI — never a raw "CredentialError error N".
     public var errorDescription: String? {
@@ -39,6 +41,8 @@ public enum CredentialError: Error, Equatable, LocalizedError {
             return "Couldn't refresh your Claude session (HTTP \(status)). Open Claude Code to refresh it."
         case .decodingFailed:
             return "Couldn't read the stored Claude credentials. Sign in to Claude Code again."
+        case .writeVerificationFailed:
+            return "Couldn't safely update the Claude credentials in the Keychain, so refresh is disabled. Open Claude Code to refresh your session."
         }
     }
 }
@@ -74,19 +78,23 @@ public protocol TokenProvider: Sendable {
 /// subprocess is always run off the actor's executor (see `runCommand`).
 public actor CredentialStore: TokenProvider {
     public static let keychainService = "Claude Code-credentials"
-    public static let keychainAccount = "claude-cli"
 
     private static let refreshURL = URL(string: "https://console.anthropic.com/v1/oauth/token")!
     private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     private static let scope = "user:profile user:inference user:sessions:claude_code"
     /// Refresh once we're within this many milliseconds of expiry.
     private static let expiryBufferMs: Double = 5 * 60 * 1000
+    /// Longest `security -i` command line we'll pipe via stdin; longer commands fall back to argv.
+    /// `security -i` silently splits lines around 4096 bytes — this matches Claude Code's own
+    /// cutoff for the same write.
+    static let maxInlineCommandLength = 4032
 
     private let runner: CommandRunner
     private let transport: HTTPTransport
     private let now: @Sendable () -> Date
     private let fallbackFileURL: URL
     private let writeAccessStore: WriteAccessStore
+    private let service: String
 
     /// Resolved write-access capability for this session (nil until first resolved/probed).
     private var canWrite: Bool?
@@ -99,13 +107,15 @@ public actor CredentialStore: TokenProvider {
         now: @escaping @Sendable () -> Date = Date.init,
         fallbackFileURL: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/.credentials.json"),
-        writeAccessStore: WriteAccessStore = WriteAccessStore()
+        writeAccessStore: WriteAccessStore = WriteAccessStore(),
+        service: String = CredentialStore.keychainService
     ) {
         self.runner = runner
         self.transport = transport
         self.now = now
         self.fallbackFileURL = fallbackFileURL
         self.writeAccessStore = writeAccessStore
+        self.service = service
     }
 
     // MARK: TokenProvider
@@ -162,13 +172,17 @@ public actor CredentialStore: TokenProvider {
     }
 
     /// Re-save the exact stored credential bytes back to the Keychain — a true no-op that only
-    /// triggers the modify-ACL prompt. Returns whether the write succeeded.
+    /// triggers the modify-ACL prompt — then read them back and require a byte-exact match.
+    /// Returns whether the verified round-trip succeeded. Targeting the item's own account (not a
+    /// name we invent) is what makes this an update of Claude Code's item rather than the creation
+    /// of a second, shadowing item.
     private func probeWriteAccess() async -> Bool {
         do {
-            let raw = try await readRawKeychain()
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let account = await resolveWriteAccount() else { return false }
+            let value = (try await readRawKeychain(account: account))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !value.isEmpty else { return false }
-            try await persistRaw(value)
+            try await persistVerified(value, account: account)
             return true
         } catch {
             return false
@@ -197,8 +211,61 @@ public actor CredentialStore: TokenProvider {
 
     // MARK: Loading
 
-    private func readRawKeychain() async throws -> String {
-        try await runCommand("/usr/bin/security", ["find-generic-password", "-s", Self.keychainService, "-w"])
+    /// Read the raw secret. Pass the resolved `account` on write paths so the read, the write, and
+    /// the verification all target the same item; the unqualified form is for read-only loads.
+    private func readRawKeychain(account: String? = nil) async throws -> String {
+        var arguments = ["find-generic-password", "-s", service]
+        if let account { arguments += ["-a", account] }
+        arguments.append("-w")
+        return Self.normalizeSecretOutput(try await runCommand("/usr/bin/security", arguments))
+    }
+
+    /// `find-generic-password -w` prints the secret hex-encoded (lowercase, no 0x prefix) whenever
+    /// it contains a byte outside ASCII. Failing to decode that form would be corruption-by-read:
+    /// the probe would write the hex STRING back as the new secret and then "verify" its own
+    /// damage. Decoding is unambiguous for this store's only payload — a JSON envelope starts with
+    /// `{`, which is not a hex digit, so the raw form is never all-hex and the hex form always is.
+    nonisolated static func normalizeSecretOutput(_ output: String) -> String {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hexDigits = CharacterSet(charactersIn: "0123456789abcdef")
+        guard !trimmed.isEmpty, trimmed.count.isMultiple(of: 2),
+              trimmed.unicodeScalars.allSatisfy(hexDigits.contains) else { return trimmed }
+        var data = Data(capacity: trimmed.count / 2)
+        var idx = trimmed.startIndex
+        while idx < trimmed.endIndex {
+            let next = trimmed.index(idx, offsetBy: 2)
+            guard let byte = UInt8(trimmed[idx..<next], radix: 16) else { return trimmed }
+            data.append(byte)
+            idx = next
+        }
+        // Not decodable as UTF-8 → it wasn't our hex form; keep the literal output.
+        return String(data: data, encoding: .utf8) ?? trimmed
+    }
+
+    /// The account name of the existing Keychain item (from its metadata — Claude Code stores the
+    /// item under the login user name, but discovering it beats assuming it). `nil` when there is
+    /// no item or the account can't be parsed; callers must then treat the item as unwritable.
+    private func resolveWriteAccount() async -> String? {
+        guard let metadata = try? await runCommand("/usr/bin/security", ["find-generic-password", "-s", service]) else {
+            return nil
+        }
+        return Self.parseAccount(fromMetadata: metadata)
+    }
+
+    /// Extract the account from `security find-generic-password` metadata output, e.g.
+    /// `    "acct"<blob>="stefan"` (a hex-prefixed form `=0x…  "stefan"` appears for non-ASCII).
+    nonisolated static func parseAccount(fromMetadata metadata: String) -> String? {
+        for line in metadata.split(separator: "\n") {
+            guard let marker = line.range(of: "\"acct\"<blob>=") else { continue }
+            let rest = line[marker.upperBound...]
+            guard rest != "<NULL>",
+                  let open = rest.firstIndex(of: "\""),
+                  let close = rest.lastIndex(of: "\""),
+                  open < close else { return nil }
+            let account = String(rest[rest.index(after: open)..<close])
+            return account.isEmpty ? nil : account
+        }
+        return nil
     }
 
     /// Read credentials from the Keychain; fall back to `~/.claude/.credentials.json` only when
@@ -275,18 +342,25 @@ public actor CredentialStore: TokenProvider {
     /// token is returned for in-session use and refresh is disabled (downgraded to read-only) so we
     /// stop consuming the rotating token on a machine that can't save it.
     private func performRefresh() async throws -> ClaudeCredentials {
+        // The write-back must update the item Claude Code reads, so refresh requires knowing the
+        // item's account. Failing to resolve it counts as write-denied.
+        guard let account = await resolveWriteAccount() else {
+            setWriteGranted(false)
+            throw CredentialError.refreshFailed(status: 0, message: "Keychain item account could not be resolved")
+        }
         // Read the RAW Keychain blob (not load()'s decoded 3-field form, and not the file fallback):
         // we refresh the live Keychain item in place and must preserve every field Claude Code
         // stored (scopes, subscriptionType, …).
-        let raw = (try await readRawKeychain()).trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = (try await readRawKeychain(account: account)).trimmingCharacters(in: .whitespacesAndNewlines)
         let current = try decodeEnvelope(raw)
 
         // Prove we can write the Keychain THIS session BEFORE consuming the single-use token: write
-        // the exact stored bytes back (a true no-op). If it fails — e.g. a stale "granted" flag on a
-        // machine whose ACL has since changed — downgrade to read-only and abort WITHOUT POSTing, so
-        // the rotating token is never consumed on a machine that can't save the replacement.
+        // the exact stored bytes back (a true no-op) and verify the round-trip. If it fails — e.g.
+        // a stale "granted" flag on a machine whose ACL has since changed, or a write path that
+        // corrupts the bytes — downgrade to read-only and abort WITHOUT POSTing, so the rotating
+        // token is never consumed on a machine that can't faithfully save the replacement.
         do {
-            try await persistRaw(raw)
+            try await persistVerified(raw, account: account)
         } catch {
             setWriteGranted(false)
             throw error
@@ -332,7 +406,7 @@ public actor CredentialStore: TokenProvider {
         // refreshed token for this call and stop refreshing. Log the failure only — never the
         // credentials themselves.
         do {
-            try await persistRaw(updated)
+            try await persistVerified(updated, account: account)
         } catch {
             setWriteGranted(false)
             fputs("[ClaudeUsage] Keychain write-back failed after refresh; disabling refresh: \(error)\n", stderr)
@@ -365,18 +439,52 @@ public actor CredentialStore: TokenProvider {
 
     // MARK: Writing
 
-    /// Write a raw secret string to the Keychain item. `add-generic-password -w` with no inline
-    /// value prompts for the password and a "retype" confirmation, both read from stdin — so the
-    /// (single-line) value is sent twice. Keeping the `security` CLI as the accessor preserves the
-    /// existing Keychain ACL versus the in-process SecItem APIs.
-    private func persistRaw(_ value: String) async throws {
-        let stdin = "\(value)\n\(value)\n"
+    /// Write a raw secret string to the Keychain item, hex-encoded via `-X` so no byte of the
+    /// value needs quoting. The command is piped to `security -i` (keeping the secret out of the
+    /// process argument list) when it fits `security`'s ~4 KB line buffer; longer payloads fall
+    /// back to argv — the same strategy Claude Code itself uses for this item. Never use the
+    /// stdin password prompt (`-w` with no value): it silently truncates at 128 bytes, which is
+    /// exactly how v1 of this code corrupted its copy of the credentials.
+    private func persistRaw(_ value: String, account: String) async throws {
+        let hex = Self.hexEncode(value)
+        let line = "add-generic-password -U -a \"\(account)\" -s \"\(service)\" -X \"\(hex)\"\n"
+        if line.utf8.count <= Self.maxInlineCommandLength {
+            _ = try await runCommand("/usr/bin/security", ["-i"], stdin: line)
+        } else {
+            try await writeViaArgv(hex: hex, account: account)
+        }
+    }
+
+    private func writeViaArgv(hex: String, account: String) async throws {
         _ = try await runCommand("/usr/bin/security", [
             "add-generic-password", "-U",
-            "-a", Self.keychainAccount,
-            "-s", Self.keychainService,
-            "-w",
-        ], stdin: stdin)
+            "-a", account,
+            "-s", service,
+            "-X", hex,
+        ])
+    }
+
+    nonisolated static func hexEncode(_ value: String) -> String {
+        Data(value.utf8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Persist and then read back, requiring a byte-exact round-trip. A write that "succeeds" but
+    /// stores different bytes (truncation, encoding, a second item) must count as write-denied —
+    /// silent corruption of the shared credential is the one unrecoverable failure mode. Because
+    /// the wrong bytes are already in the shared item at that point, one repair is attempted with
+    /// the argv form (immune to `security -i` line limits) before giving up.
+    private func persistVerified(_ value: String, account: String) async throws {
+        try await persistRaw(value, account: account)
+        if await readBackMatches(value, account: account) { return }
+        try? await writeViaArgv(hex: Self.hexEncode(value), account: account)
+        guard await readBackMatches(value, account: account) else {
+            throw CredentialError.writeVerificationFailed
+        }
+    }
+
+    private func readBackMatches(_ value: String, account: String) async -> Bool {
+        guard let readBack = try? await readRawKeychain(account: account) else { return false }
+        return readBack.trimmingCharacters(in: .whitespacesAndNewlines) == value
     }
 }
 
